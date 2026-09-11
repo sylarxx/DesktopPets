@@ -212,6 +212,7 @@ try {
   Copy-Item -LiteralPath (Join-Path $Root 'scripts\windows-msi\Test-HualiAIMsi.ps1') -Destination $stagingDirectory
   Copy-Item -LiteralPath (Join-Path $Root 'scripts\windows-msi\Test-HualiAISilentDeployment.ps1') -Destination $stagingDirectory
   Copy-Item -LiteralPath (Join-Path $Root 'scripts\windows-msi\Test-HualiAIWindowsVisualSmoke.ps1') -Destination $stagingDirectory
+  Copy-Item -LiteralPath (Join-Path $Root 'scripts\windows-msi\Test-HualiAIMessageDrag.ps1') -Destination $stagingDirectory
   Copy-Item -LiteralPath (Join-Path $Root 'scripts\windows-msi\平台部署说明.txt') -Destination (Join-Path $stagingDirectory 'README.txt')
 
   $msiHash = (Get-FileHash -LiteralPath $outputMsi -Algorithm SHA256).Hash.ToLowerInvariant()

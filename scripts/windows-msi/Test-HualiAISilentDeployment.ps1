@@ -410,6 +410,10 @@ function Invoke-DesktopAuthProtocolCallbackSmoke {
       }
     }
 
+    & (Join-Path $PSScriptRoot 'Test-HualiAIMessageDrag.ps1') `
+      -ApplicationProcessId $existingProcess.Id `
+      -OutputDirectory (Join-Path $DiagnosticEvidenceDirectory 'message-drag')
+
     # A successful callback is not sufficient if the session disappears with
     # the renderer process. Restart the installed executable against the same
     # WebView2 profile and require the persisted session to be restored.
