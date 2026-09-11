@@ -95,6 +95,9 @@ jobs:
           src/utils/sys-message-expiry.test.ts
           src/utils/windows-deployment-script-contract.test.ts
 
+      - name: Verify message actions across expiry and queue transitions
+        run: node scripts/qa/check-message-action-lifetime.mjs
+
       - name: Build intranet frontend
         run: npm run build:intranet
 

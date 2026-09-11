@@ -596,7 +596,7 @@ function hideCurrentSysMessage(message: SysMessageNotification) {
 }
 
 async function handleSysMessageRead(message: SysMessageNotification) {
-  if (sysMessageReadPendingKey.value || sysMessageReadAllPending.value) return
+  if (isCurrentSysMessageReadPending.value) return
 
   if (isSysMessagePreview) {
     hideCurrentSysMessage(message)
@@ -613,7 +613,9 @@ async function handleSysMessageRead(message: SysMessageNotification) {
   } catch (error) {
     if (actionSession !== sysMessageEnrichmentGeneration) return
     console.warn('Failed to mark sys_message as read', error)
-    sysMessageActionError.value = '未能标记已读，请检查网络后重试'
+    if (currentSysMessage.value?.dedupeKey === message.dedupeKey) {
+      sysMessageActionError.value = '未能标记已读，请检查网络后重试'
+    }
   } finally {
     if (actionSession !== sysMessageEnrichmentGeneration) return
     if (sysMessageReadPendingKey.value === message.dedupeKey) {
@@ -623,7 +625,7 @@ async function handleSysMessageRead(message: SysMessageNotification) {
 }
 
 async function handleAllSysMessagesRead() {
-  if (sysMessageReadPendingKey.value || sysMessageReadAllPending.value) return
+  if (isCurrentSysMessageReadPending.value) return
   expireStaleSysMessages()
   const snapshot = [
     ...(currentSysMessage.value ? [currentSysMessage.value] : []),
@@ -657,7 +659,9 @@ async function handleAllSysMessagesRead() {
   } catch (error) {
     if (actionSession !== sysMessageEnrichmentGeneration) return
     console.warn('Failed to mark all sys_messages as read', error)
-    sysMessageActionError.value = '未能全部标为已读，消息已保留，请稍后重试'
+    if (currentSysMessage.value && snapshotKeys.has(currentSysMessage.value.dedupeKey)) {
+      sysMessageActionError.value = '未能全部标为已读，消息已保留，请稍后重试'
+    }
   } finally {
     if (actionSession !== sysMessageEnrichmentGeneration) return
     sysMessageReadAllPending.value = false
@@ -665,7 +669,7 @@ async function handleAllSysMessagesRead() {
 }
 
 async function handleSysMessageView(message: SysMessageNotification) {
-  if (sysMessageReadPendingKey.value || sysMessageReadAllPending.value) return
+  if (isCurrentSysMessageReadPending.value) return
 
   if (isSysMessagePreview) {
     hideCurrentSysMessage(message)
@@ -679,7 +683,9 @@ async function handleSysMessageView(message: SysMessageNotification) {
     const opened = await openSysMessageDetail(message)
     if (actionSession !== sysMessageEnrichmentGeneration) return
     if (!opened) {
-      sysMessageActionError.value = '未能打开详情，请检查默认浏览器后重试'
+      if (currentSysMessage.value?.dedupeKey === message.dedupeKey) {
+        sysMessageActionError.value = '未能打开详情，请检查默认浏览器后重试'
+      }
       return
     }
 
@@ -695,7 +701,9 @@ async function handleSysMessageView(message: SysMessageNotification) {
     } catch (error) {
       if (actionSession !== sysMessageEnrichmentGeneration) return
       console.warn('Failed to mark viewed sys_message as read', error)
-      sysMessageActionError.value = '详情已打开，但未能标记已读；可点击“知道了”重试'
+      if (currentSysMessage.value?.dedupeKey === message.dedupeKey) {
+        sysMessageActionError.value = '详情已打开，但未能标记已读；可点击“知道了”重试'
+      }
       return
     }
 
