@@ -94,4 +94,34 @@ describe('task store queue', () => {
     expect(store.taskQueue).toHaveLength(0)
     expect(store.latestMessage).toBe('')
   })
+
+  it.each(['success', 'failure'])('ignores a late %s after a new session replaces the same task ID', async (outcome) => {
+    let finish!: (result: { success: boolean; message: string }) => void
+    mocks.requestTaskAction.mockReturnValue(new Promise(resolve => { finish = resolve }))
+    const store = useTaskStore()
+    store.pushTask(task(1))
+    const pending = store.handleAction('event-1', 'task-1', 'confirm')
+    store.clearTasks()
+    store.pushTask(task(1))
+    const nextTask = store.currentTask
+    finish({ success: outcome === 'success', message: '旧账号操作结果' })
+
+    await expect(pending).resolves.toBe(false)
+    expect(store.currentTask).toBe(nextTask)
+    expect(store.taskQueue).toHaveLength(1)
+    expect(store.latestMessage).toBe('收到一个新任务')
+    expect(store.currentTask?.error).toBeUndefined()
+  })
+
+  it('ignores detail-opening feedback after session clearing', async () => {
+    let finish!: (opened: boolean) => void
+    mocks.openCalendar.mockReturnValue(new Promise(resolve => { finish = resolve }))
+    const store = useTaskStore()
+    store.pushTask(task(1))
+    const pending = store.handleAction('event-1', 'task-1', 'openDetail')
+    store.clearTasks()
+    finish(true)
+    await expect(pending).resolves.toBe(false)
+    expect(store.latestMessage).toBe('')
+  })
 })

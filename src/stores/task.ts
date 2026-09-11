@@ -45,18 +45,21 @@ export const useTaskStore = defineStore('task', {
     async handleAction(eventId: string, taskId: string, action: TaskAction) {
       const task = this.taskQueue.find((item) => item.eventId === eventId && item.payload.taskId === taskId)
       if (!task || task.handling) return false
+      const isCurrent = () => this.taskQueue.includes(task)
 
       task.handling = true
       task.error = ''
       try {
         if (action === 'openDetail') {
           const opened = await openCalendar(taskId)
+          if (!isCurrent()) return false
           if (!opened) throw new Error('未能打开任务详情，请检查浏览器后重试')
           this.latestMessage = '已打开任务详情'
           return true
         }
 
         const response = await requestTaskAction({ eventId, taskId, action })
+        if (!isCurrent()) return false
         if (!response.success) {
           throw new Error(response.message || '操作失败，请重试')
         }
@@ -64,6 +67,7 @@ export const useTaskStore = defineStore('task', {
         this.removeTask(taskId)
         return true
       } catch (error) {
+        if (!isCurrent()) return false
         task.error = error instanceof Error ? error.message : '操作失败，请重试'
         this.latestMessage = task.error
         return false

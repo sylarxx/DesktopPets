@@ -36,6 +36,7 @@ jobs:
           src/services/window.service.test.ts
           src/services/desktop-auth.service.test.ts
           src/services/session.service.test.ts
+          src/stores/task.test.ts
           src/utils/notification-delivery.test.ts
           src/utils/notification-task-contract.test.ts
           src/utils/mascot-menu-architecture.test.ts

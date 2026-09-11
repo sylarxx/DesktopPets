@@ -187,12 +187,12 @@ async function submitTodo(text: string) {
 
 async function handleTaskAction(eventId: string, taskId: string, action: TaskAction) {
   if (props.task?.handling) return
-
+  const operation = operationGeneration
   const succeeded = await taskStore.handleAction(eventId, taskId, action)
-
+  if (operation !== operationGeneration) return
   await nextTick()
   syncVisiblePanelHeight()
-  if (!succeeded || action === 'confirm') focusVisibleControl()
+  if (props.task?.eventId === eventId && (!succeeded || action === 'confirm')) focusVisibleControl()
 }
 </script>
 
