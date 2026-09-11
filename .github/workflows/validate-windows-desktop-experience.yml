@@ -1,0 +1,75 @@
+name: Validate Windows desktop experience candidate
+
+on:
+  push:
+    branches:
+      - codex/desktop-experience-20260910
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-desktop-experience-candidate
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    runs-on: windows-latest
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install locked dependencies and native tools
+        shell: pwsh
+        run: |
+          npm ci
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          rustup component add rustfmt clippy
+      - name: Verify changed frontend contracts and compatibility boundaries
+        run: >-
+          npm test --
+          src/services/request.test.ts
+          src/services/sys-message.service.test.ts
+          src/services/window.service.test.ts
+          src/services/desktop-auth.service.test.ts
+          src/services/session.service.test.ts
+          src/utils/notification-delivery.test.ts
+          src/utils/notification-task-contract.test.ts
+          src/utils/mascot-menu-architecture.test.ts
+          src/utils/mascot-single-layer-animation.test.ts
+          src/utils/sys-message-display.test.ts
+          src/utils/sys-message-expiry.test.ts
+      - name: Check native formatting and changed geometry and lifetime contracts
+        shell: pwsh
+        run: |
+          cargo fmt --manifest-path .\src-tauri\Cargo.toml -- --check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          foreach ($filter in @('geometry', 'panel_', 'notification_', 'outside_focus')) {
+            cargo test --locked --manifest-path .\src-tauri\Cargo.toml $filter
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+          cargo clippy --locked --manifest-path .\src-tauri\Cargo.toml -- -D warnings
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Build intranet executable for native visual validation
+        shell: pwsh
+        run: |
+          $env:BUILD_MODE = 'intranet'
+          npm run tauri -- build --no-bundle
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Verify real Windows window and mouse behavior
+        shell: pwsh
+        run: |
+          & .\scripts\windows-msi\Test-HualiAIWindowsVisualSmoke.ps1 `
+            -ExecutablePath .\src-tauri\target\release\HualiAIDesktopAssistant.exe `
+            -OutputDirectory .\artifacts\windows-experience-qa
+      - name: Upload candidate validation evidence
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: windows-experience-qa-${{ github.run_id }}
+          path: artifacts/windows-experience-qa/
+          if-no-files-found: warn
+          retention-days: 30
