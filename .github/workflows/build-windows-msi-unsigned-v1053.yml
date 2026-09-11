@@ -1,0 +1,210 @@
+name: Build Windows formal MSI v1.0.53 desktop experience
+
+on:
+  push:
+    branches:
+      - codex/desktop-experience-1.0.53
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: windows-enterprise-msi-unsigned-v1053
+  cancel-in-progress: false
+
+jobs:
+  build-msi:
+    runs-on: windows-latest
+    timeout-minutes: 80
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Initialize durable QA evidence
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path .\artifacts\windows-deployment-smoke -Force | Out-Null
+          [ordered]@{
+            repository = '${{ github.repository }}'
+            commit = '${{ github.sha }}'
+            runId = '${{ github.run_id }}'
+            runner = '${{ runner.name }}'
+            startedAt = [DateTime]::UtcNow.ToString('o')
+          } | ConvertTo-Json | Set-Content `
+            -LiteralPath .\artifacts\windows-deployment-smoke\workflow-run.json `
+            -Encoding UTF8
+
+      - name: Compile Windows release gates with PowerShell 7
+        shell: pwsh
+        run: |
+          & .\scripts\windows-msi\Test-HualiAIWindowsVisualSmoke.ps1 -CompileBackdropOnly
+          foreach ($gate in @(
+            '.\scripts\windows-msi\Test-HualiAIMsi.ps1',
+            '.\scripts\windows-msi\Test-HualiAISilentDeployment.ps1'
+          )) {
+            [scriptblock]::Create((Get-Content -LiteralPath $gate -Raw)) | Out-Null
+          }
+
+      - name: Compile Windows release gates with Windows PowerShell 5.1
+        shell: powershell
+        run: |
+          & .\scripts\windows-msi\Test-HualiAIWindowsVisualSmoke.ps1 -CompileBackdropOnly
+          foreach ($gate in @(
+            '.\scripts\windows-msi\Test-HualiAIMsi.ps1',
+            '.\scripts\windows-msi\Test-HualiAISilentDeployment.ps1'
+          )) {
+            [scriptblock]::Create((Get-Content -LiteralPath $gate -Raw)) | Out-Null
+          }
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Set up stable Rust MSVC
+        shell: pwsh
+        run: |
+          rustup toolchain install stable-x86_64-pc-windows-msvc --profile minimal
+          rustup default stable-x86_64-pc-windows-msvc
+          rustup component add rustfmt clippy
+
+      - name: Install locked dependencies
+        run: npm ci
+
+      - name: Verify changed contracts and protected interactions
+        run: >-
+          npm test --
+          src/services/request.test.ts
+          src/services/sys-message.service.test.ts
+          src/services/window.service.test.ts
+          src/services/desktop-auth.service.test.ts
+          src/services/session.service.test.ts
+          src/services/session-recovery.service.test.ts
+          src/stores/task.test.ts
+          src/utils/notification-delivery.test.ts
+          src/utils/notification-task-contract.test.ts
+          src/utils/mascot-menu-architecture.test.ts
+          src/utils/mascot-click-gesture.test.ts
+          src/utils/mascot-single-layer-animation.test.ts
+          src/utils/sys-message-display.test.ts
+          src/utils/sys-message-expiry.test.ts
+          src/utils/windows-deployment-script-contract.test.ts
+
+      - name: Build intranet frontend
+        run: npm run build:intranet
+
+      - name: Check native formatting
+        run: cargo fmt --manifest-path .\src-tauri\Cargo.toml -- --check
+
+      - name: Verify changed native geometry and window lifetimes
+        shell: pwsh
+        run: |
+          foreach ($filter in @('geometry', 'panel_', 'notification_', 'outside_focus', 'context_menu')) {
+            cargo test --locked --manifest-path .\src-tauri\Cargo.toml $filter
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+
+      - name: Reject native warnings
+        run: cargo clippy --locked --manifest-path .\src-tauri\Cargo.toml -- -D warnings
+
+      - name: Build and validate unsigned intranet enterprise MSI
+        shell: pwsh
+        run: |
+          & .\scripts\build-windows-msi.ps1 -Mode intranet -AllowUnsigned -SkipNpmCi
+
+      - name: Download pinned v1.0.52 upgrade baseline
+        uses: actions/download-artifact@v6
+        with:
+          name: huali-windows-enterprise-msi-intranet-v1.0.52
+          path: artifacts/previous-release
+          github-token: ${{ github.token }}
+          run-id: 33485878303
+
+      - name: Verify pinned v1.0.52 upgrade baseline
+        shell: pwsh
+        run: |
+          $expectedHash = 'ed40f05598bec59b75c2363386eafebb7fce19da2014dc002dc77ab321e1e8b8'
+          $oldMsi = @(Get-ChildItem .\artifacts\previous-release -Recurse -File -Filter '*.msi')
+          if ($oldMsi.Count -ne 1) {
+            throw "Pinned v1.0.52 artifact must contain exactly one MSI; found $($oldMsi.Count)."
+          }
+          $actualHash = (Get-FileHash -LiteralPath $oldMsi[0].FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          [ordered]@{
+            sourceRunId = '33485878303'
+            artifact = 'huali-windows-enterprise-msi-intranet-v1.0.52'
+            path = $oldMsi[0].FullName
+            expectedSha256 = $expectedHash
+            actualSha256 = $actualHash
+            verifiedAt = [DateTime]::UtcNow.ToString('o')
+          } | ConvertTo-Json | Set-Content `
+            -LiteralPath .\artifacts\windows-deployment-smoke\previous-msi.json `
+            -Encoding UTF8
+          if ($actualHash -ne $expectedHash) {
+            throw "Pinned v1.0.52 MSI SHA256 mismatch: actual=$actualHash expected=$expectedHash."
+          }
+          "HUALI_PREVIOUS_MSI=$($oldMsi[0].FullName)" | Out-File `
+            -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Verify administrator upgrade, trailing-slash login callback, cleanup, and interaction
+        shell: pwsh
+        run: |
+          $msi = Get-ChildItem .\artifacts\windows-msi-intranet\*.msi | Select-Object -First 1
+          if (-not $msi) { throw 'MSI artifact was not found.' }
+          & .\scripts\windows-msi\Test-HualiAISilentDeployment.ps1 `
+            -MsiPath $msi.FullName `
+            -ExpectedVersion '1.0.53' `
+            -PreviousMsiPath $env:HUALI_PREVIOUS_MSI `
+            -PreviousVersion '1.0.52' `
+            -PreviousMsiSha256 'ed40f05598bec59b75c2363386eafebb7fce19da2014dc002dc77ab321e1e8b8' `
+            -RequireDiagnosticLogCleanup `
+            -ValidateDefaultLaunch `
+            -RunVisualSmoke `
+            -EvidenceDirectory .\artifacts\windows-deployment-smoke
+
+      - name: Finalize QA evidence even after failure
+        if: always()
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path .\artifacts\windows-deployment-smoke -Force | Out-Null
+          [ordered]@{
+            repository = '${{ github.repository }}'
+            commit = '${{ github.sha }}'
+            runId = '${{ github.run_id }}'
+            jobStatusBeforeEvidenceUpload = '${{ job.status }}'
+            completedAt = [DateTime]::UtcNow.ToString('o')
+          } | ConvertTo-Json | Set-Content `
+            -LiteralPath .\artifacts\windows-deployment-smoke\workflow-final-state.json `
+            -Encoding UTF8
+
+      - name: Attach validated deployment evidence and release notes
+        if: success()
+        shell: pwsh
+        run: |
+          $package = '.\artifacts\windows-msi-intranet'
+          Copy-Item '.\docs\releases\v1.0.53.md' (Join-Path $package 'RELEASE-NOTES.md')
+          Copy-Item '.\artifacts\windows-deployment-smoke' (Join-Path $package 'QA-EVIDENCE') -Recurse
+          $zip = '.\artifacts\huali-ai-mascot-1.0.53-intranet-windows-enterprise-msi-x64.zip'
+          Compress-Archive -Path (Join-Path $package '*') -DestinationPath $zip -CompressionLevel Optimal -Force
+
+      - name: Upload administrator distribution package
+        if: success()
+        uses: actions/upload-artifact@v6
+        with:
+          name: huali-windows-enterprise-msi-intranet-v1.0.53
+          path: |
+            artifacts/windows-msi-intranet/
+            artifacts/*-intranet-windows-enterprise-msi-x64.zip
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Always upload deployment QA evidence
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: huali-windows-qa-evidence-v1.0.53-${{ github.run_id }}
+          path: artifacts/windows-deployment-smoke/
+          if-no-files-found: warn
+          retention-days: 30
