@@ -24,6 +24,16 @@ public static class HualiMessageDragNative {
   [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
   [DllImport("user32.dll")] public static extern IntPtr SetThreadDpiAwarenessContext(IntPtr context);
   [DllImport("user32.dll")] public static extern void mouse_event(uint flags, uint x, uint y, uint data, UIntPtr extra);
+  [DllImport("user32.dll", EntryPoint = "SystemParametersInfoW")] private static extern bool GetSystemParameter(uint action, uint parameter, out int value, uint flags);
+  [DllImport("user32.dll", EntryPoint = "SystemParametersInfoW")] private static extern bool SetSystemParameter(uint action, uint parameter, IntPtr value, uint flags);
+  public static bool FullWindowDrag() {
+    int value;
+    if (!GetSystemParameter(0x0026, 0, out value, 0)) throw new InvalidOperationException("Cannot read full-window drag setting.");
+    return value != 0;
+  }
+  public static void FullWindowDrag(bool enabled) {
+    if (!SetSystemParameter(0x0025, enabled ? 1u : 0u, IntPtr.Zero, 0)) throw new InvalidOperationException("Cannot set full-window drag setting.");
+  }
   public static Window[] Snapshot(int processId) {
     var list = new List<Window>();
     EnumWindows((window, parameter) => {
@@ -52,7 +62,15 @@ function Save-DragScreen([string]$Name) {
 function Get-DragWindows { return @([HualiMessageDragNative]::Snapshot($ApplicationProcessId)) }
 $report = [ordered]@{ ok = $false; failure = $null; samples = @(); scope = 'real mouse drag of authenticated system message card' }
 $mouseDown = $false
+$originalFullWindowDrag = [HualiMessageDragNative]::FullWindowDrag()
 try {
+  # The CI desktop defaults to outline-only dragging. Exercise live HWND motion
+  # without changing the application or persisting a Windows user preference.
+  # https://learn.microsoft.com/windows/win32/api/winuser/nf-winuser-systemparametersinfow
+  [HualiMessageDragNative]::FullWindowDrag($true)
+  $report.originalFullWindowDrag = $originalFullWindowDrag
+  $report.testFullWindowDrag = [HualiMessageDragNative]::FullWindowDrag()
+  if (-not $report.testFullWindowDrag) { throw '无法启用测试所需的完整窗口拖动。' }
   $readyDeadline = [DateTime]::UtcNow.AddSeconds(10)
   do {
   $before = Get-DragWindows
@@ -72,12 +90,15 @@ try {
   Save-DragScreen 'message-before-drag.png'
   $startX = $mascot.Left + [int]($mascot.Width / 2)
   $startY = $mascot.Top + [int]($mascot.Height / 2)
+  $workArea = [Windows.Forms.Screen]::FromHandle([IntPtr]$mascot.Handle).WorkingArea
+  $directionX = if ($startX -lt ($workArea.Left + $workArea.Width / 2)) { 1 } else { -1 }
+  $directionY = if ($startY -lt ($workArea.Top + $workArea.Height / 2)) { 1 } else { -1 }
   [HualiMessageDragNative]::SetCursorPos($startX, $startY) | Out-Null
   Start-Sleep -Milliseconds 150
   [HualiMessageDragNative]::mouse_event(2, 0, 0, 0, [UIntPtr]::Zero)
   $mouseDown = $true
   for ($step = 1; $step -le 12; $step++) {
-    [HualiMessageDragNative]::SetCursorPos(($startX - $step * 12), ($startY - $step * 4)) | Out-Null
+    [HualiMessageDragNative]::SetCursorPos(($startX + $directionX * $step * 12), ($startY + $directionY * $step * 4)) | Out-Null
     Start-Sleep -Milliseconds 70
     $windows = Get-DragWindows
     $visibleCard = $windows | Where-Object { $_.Handle -eq $card.Handle } | Select-Object -First 1
@@ -92,6 +113,7 @@ try {
   $after = Get-DragWindows
   $afterMascot = $after | Where-Object { $_.Handle -eq $mascot.Handle } | Select-Object -First 1
   $afterCard = $after | Where-Object { $_.Handle -eq $card.Handle } | Select-Object -First 1
+  $report.after = [ordered]@{ mascot = $afterMascot; card = $afterCard }
   if (-not $afterMascot -or -not $afterCard) { throw '松手后原卡片或机器人窗口消失。' }
   if ([Math]::Abs($afterMascot.Left - $mascot.Left) -lt 60) { throw '真实鼠标操作没有形成有效拖动。' }
   if ([Math]::Abs($afterCard.Left - $card.Left) + [Math]::Abs($afterCard.Top - $card.Top) -lt 30) { throw '消息卡片没有跟随机器人移动。' }
@@ -100,6 +122,12 @@ try {
     $afterCard.Top -lt ($afterMascot.Top + $afterMascot.Height) -and
     ($afterCard.Top + $afterCard.Height) -gt $afterMascot.Top
   if ($overlaps) { throw '松手后消息卡片覆盖机器人窗口。' }
+  $liveFollowSamples = @($report.samples | Where-Object {
+    [Math]::Abs($_.mascot.Left - $mascot.Left) -ge 30 -and
+    ([Math]::Abs($_.card.Left - $card.Left) + [Math]::Abs($_.card.Top - $card.Top)) -ge 20
+  }).Count
+  if ($liveFollowSamples -lt 4) { throw '卡片未在实际拖动过程中持续跟随机器人。' }
+  $report.liveFollowSamples = $liveFollowSamples
   $report.after = [ordered]@{ mascot = $afterMascot; card = $afterCard; sameWindows = $true; noOverlap = $true }
   Save-DragScreen 'message-after-drag.png'
   $report.ok = $true
@@ -109,5 +137,7 @@ try {
   throw
 } finally {
   if ($mouseDown) { [HualiMessageDragNative]::mouse_event(4, 0, 0, 0, [UIntPtr]::Zero) }
+  [HualiMessageDragNative]::FullWindowDrag($originalFullWindowDrag)
+  $report.restoredFullWindowDrag = [HualiMessageDragNative]::FullWindowDrag()
   $report | ConvertTo-Json -Depth 10 | Set-Content (Join-Path $OutputDirectory 'message-drag-report.json') -Encoding UTF8
 }
