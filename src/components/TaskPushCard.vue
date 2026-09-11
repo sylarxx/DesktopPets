@@ -34,7 +34,21 @@ function focusCard() {
   cardRef.value?.focus()
 }
 
-defineExpose({ focusCard })
+function getPreferredHeight() {
+  const card = cardRef.value
+  if (!card) return 240
+  const style = getComputedStyle(card)
+  let height = 16 + parseFloat(style.paddingTop) + parseFloat(style.paddingBottom) + 2
+  for (const child of Array.from(card.querySelectorAll(':scope > .task-card__reading > *, :scope > .task-card__actions'))) {
+    const box = child as HTMLElement
+    const css = getComputedStyle(box)
+    height += (box.classList.contains('task-card__body') ? box.scrollHeight : box.offsetHeight)
+      + parseFloat(css.marginTop || '0') + parseFloat(css.marginBottom || '0')
+  }
+  return Math.min(380, Math.max(180, Math.ceil(height)))
+}
+
+defineExpose({ focusCard, getPreferredHeight })
 </script>
 
 <template>
@@ -47,6 +61,7 @@ defineExpose({ focusCard })
     :aria-busy="task.handling"
     :aria-labelledby="titleId"
   >
+    <div class="task-card__reading" tabindex="0">
     <header class="task-card__header">
       <span class="task-card__kind">
         <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -61,13 +76,15 @@ defineExpose({ focusCard })
       </span>
     </header>
 
-    <div class="task-card__body">
+    <div class="task-card__body" tabindex="0">
       <h2 :id="titleId">{{ taskTitle }}</h2>
       <p v-if="taskContent" class="task-card__description" tabindex="0">{{ taskContent }}</p>
       <p v-else class="task-card__description task-card__description--empty">暂无补充说明</p>
     </div>
 
     <p v-if="task.error" class="task-card__error" role="alert">{{ task.error }}</p>
+
+    </div>
 
     <div class="task-card__actions" :class="{ 'is-single': visibleActions.length === 1 }">
       <button

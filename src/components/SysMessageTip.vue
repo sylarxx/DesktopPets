@@ -2,6 +2,7 @@
 import { computed } from 'vue'
 import type { SysMessageNotification } from '../types/sys-message'
 import {
+  classifySysMessage,
   formatSysMessageDisplayTime,
   normalizeSysMessageDateTime
 } from '../utils/sys-message-display'
@@ -22,11 +23,10 @@ const emit = defineEmits<{
 }>()
 
 const title = computed(() => props.message.msgSubject || '站内消息')
-const isCompletedTodo = computed(() => /待办已完成|已完成|处理完成/.test(title.value))
-const isMeeting = computed(() => props.message.bizType === 2 || /会议/.test(title.value))
-const isTask = computed(
-  () => !isMeeting.value && (props.message.bizType === 1 || /待办|任务|todo/i.test(title.value))
-)
+const tipTone = computed(() => classifySysMessage(props.message.bizType, title.value))
+const isMeeting = computed(() => tipTone.value === 'meeting')
+const isTask = computed(() => tipTone.value === 'todo')
+const isCompletedTodo = computed(() => isTask.value && /待办已完成|已完成|处理完成/.test(title.value))
 const isNewTodo = computed(() => /新待办|新的待办|派发/.test(title.value))
 const titleId = computed(() => `sys-message-title-${props.message.id.replace(/[^a-zA-Z0-9_-]/g, '-')}`)
 const summaryId = computed(() => `sys-message-summary-${props.message.id.replace(/[^a-zA-Z0-9_-]/g, '-')}`)
@@ -34,15 +34,9 @@ const summaryId = computed(() => `sys-message-summary-${props.message.id.replace
 const badgeLabel = computed(() => {
   if (isCompletedTodo.value) return '待办已完成'
   if (isMeeting.value) return '会议提醒'
-  if (isNewTodo.value) return '新待办'
+  if (isTask.value && isNewTodo.value) return '新待办'
   if (isTask.value) return '任务提醒'
   return '消息提醒'
-})
-
-const tipTone = computed(() => {
-  if (isMeeting.value) return 'meeting'
-  if (isTask.value) return 'todo'
-  return 'notice'
 })
 
 const displayTime = computed(() => formatSysMessageDisplayTime(props.message.createTime))
@@ -76,9 +70,14 @@ const announcement = computed(() => {
       {{ announcement }}
     </span>
     <div class="sys-message-tip__card">
+    <div class="sys-message-tip__reading" tabindex="0">
       <header class="sys-message-tip__header">
         <span class="sys-message-tip__badge">
-          <span class="sys-message-tip__badge-indicator" aria-hidden="true" />
+          <svg class="sys-message-tip__badge-icon" viewBox="0 0 24 24" aria-hidden="true">
+            <template v-if="isMeeting"><rect x="3" y="5" width="18" height="16" rx="3"/><path d="M8 2v5M16 2v5M3 10h18M7 14h2M13 14h2M7 17h2"/></template>
+            <template v-else-if="isTask"><rect x="5" y="4" width="15" height="18" rx="2"/><path d="M9 2h7v4H9zM8 12l2 2 4-4M9 18h7"/></template>
+            <template v-else><path d="M5 17h14l-2-3V9a5 5 0 0 0-10 0v5zM10 21h4"/></template>
+          </svg>
           <span class="sys-message-tip__badge-label">{{ badgeLabel }}</span>
         </span>
         <span class="sys-message-tip__meta">
@@ -87,7 +86,7 @@ const announcement = computed(() => {
         </span>
       </header>
 
-      <div class="sys-message-tip__body">
+      <div class="sys-message-tip__body" tabindex="0">
         <h2 :id="titleId">{{ title }}</h2>
         <div class="sys-message-tip__summary-shell">
           <p
@@ -103,6 +102,8 @@ const announcement = computed(() => {
       <p v-if="actionError" class="sys-message-tip__error" role="alert">
         {{ actionError }}
       </p>
+
+    </div>
 
       <div
         class="sys-message-tip__actions"

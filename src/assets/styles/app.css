@@ -2520,3 +2520,76 @@
     background-position: var(--sprite-end-offset) var(--sprite-row-offset) !important;
   }
 }
+
+/* Detached surfaces use their actual native viewport. Header, feedback and
+   actions remain fixed; the complete title and body share one scroll region. */
+.mascot-notification-window .sys-message-tip {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+.mascot-notification-window .sys-message-tip__card { min-height: 0; padding: 14px; }
+.mascot-notification-window .sys-message-tip__body {
+  display: block;
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  scrollbar-width: thin;
+  scrollbar-color: #708ba2 transparent;
+  overscroll-behavior: contain;
+}
+.mascot-notification-window .sys-message-tip__body h2 {
+  display: block; max-height: none; overflow: visible; font-size: 18px; line-height: 25px;
+}
+.mascot-notification-window .sys-message-tip__summary-shell {
+  display: block; min-height: 0; margin-top: 10px; overflow: visible;
+}
+.mascot-notification-window .sys-message-tip__body .sys-message-tip__summary,
+.mascot-notification-window .sys-message-tip.has-action-error .sys-message-tip__summary {
+  max-height: none; overflow: visible; white-space: pre-wrap;
+}
+.mascot-notification-window .sys-message-tip__header { gap: 8px; margin-bottom: 12px; }
+.sys-message-tip__badge-icon { width: 24px; height: 24px; flex: 0 0 24px; fill: none; stroke: var(--tip-accent); stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+.mascot-notification-window .sys-message-tip__badge { padding: 4px 8px; border-radius: 10px; gap: 7px; font-size: 12px; }
+.mascot-notification-window .sys-message-tip__meta { flex-direction: column-reverse; align-items: flex-end; gap: 2px; }
+.mascot-notification-window .sys-message-tip__queue-count::after { content: none; }
+.mascot-notification-window .sys-message-tip__time,
+.mascot-notification-window .sys-message-tip__queue-count { font-size: 11px; color: #bed0e1; }
+.mascot-notification-window .sys-message-tip__actions { margin-top: 12px; padding-top: 10px; border-top: 1px solid #456079; }
+.mascot-notification-window .sys-message-tip__button { min-height: 40px; }
+.mascot-notification-window .sys-message-tip__error { max-height: 40px; font-size: 12px; line-height: 20px; }
+.mascot-notification-window.is-below { align-items: flex-start; padding-top: 12px; padding-bottom: 8px; }
+.mascot-notification-window.is-left,
+.mascot-notification-window.is-right { align-items: center; }
+.mascot-notification-window:not(.is-above) .sys-message-tip__tail { display: none; }
+.mascot-notification-window .auth-login-tip { min-height: 0; max-height: 100%; }
+.mascot-notification-window .auth-login-tip__body { min-height: 0; flex: 1 1 auto; overflow: auto; }
+
+.pet-prompt .todo-input { grid-template-columns: minmax(0, 1fr) 40px; row-gap: 8px; max-height: 100%; }
+.pet-prompt .todo-input textarea { max-height: min(138px, calc(100vh - 40px)); padding-right: 5px; }
+.pet-prompt .todo-input.has-error textarea { max-height: min(138px, calc(100vh - 88px)); }
+.pet-prompt .todo-input.is-multiline .todo-input__send { margin-bottom: 0; align-self: end; }
+.todo-input__error { max-height: 40px; font-size: 12px; line-height: 20px; }
+.pet-prompt.has-task .task-card { padding: 16px; align-items: stretch; }
+.task-card__meta { flex-direction: column; align-items: flex-end; gap: 2px; }
+.task-card__body { display: block; overflow: auto; scrollbar-width: thin; }
+.pet-prompt.has-task .task-card h2 { max-height: none; overflow: visible; line-height: 23px; font-weight: 700; }
+.pet-prompt.has-task .task-card__description { overflow: visible; margin-top: 10px; font-size: 13px; line-height: 21px; white-space: pre-wrap; }
+.pet-prompt.has-task .task-card__error { max-height: 40px; font-size: 12px; line-height: 20px; }
+.task-card__body:focus-visible,
+.sys-message-tip__body:focus-visible { outline: 2px solid #6baaff; outline-offset: -2px; }
+.mascot-avatar:focus-visible { outline: 2px solid #508ff0; outline-offset: -5px; border-radius: 18px; }
+.mascot-avatar:active { filter: brightness(0.97); }
+
+.sys-message-tip__reading, .task-card__reading { display: contents; }
+@media (max-height: 220px) {
+  .mascot-notification-window .sys-message-tip__reading,
+  .pet-prompt.has-task .task-card__reading {
+    display: block; flex: 1 1 auto; min-height: 0; overflow: auto;
+    scrollbar-width: thin; overscroll-behavior: contain;
+  }
+  .mascot-notification-window .sys-message-tip__body,
+  .pet-prompt.has-task .task-card__body { overflow: visible; }
+  .mascot-notification-window .sys-message-tip__error,
+  .pet-prompt.has-task .task-card__error { max-height: none; overflow: visible; }
+}

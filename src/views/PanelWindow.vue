@@ -24,7 +24,6 @@ const props = defineProps<{
   task: TaskItem | null
 }>()
 
-const TASK_PANEL_HEIGHT = 240
 const mascotStore = useMascotStore()
 const taskStore = useTaskStore()
 const inputBoxRef = ref<InstanceType<typeof TodoInputBox> | null>(null)
@@ -34,6 +33,14 @@ const submitError = ref('')
 const isRevealing = ref(false)
 const panelHasText = ref(false)
 const panelFocused = ref(false)
+const panelComposing = ref(false)
+let operationGeneration = 0
+let panelWidth = window.innerWidth
+function handlePanelResize() {
+  if (window.innerWidth === panelWidth) return
+  panelWidth = window.innerWidth
+  void syncVisiblePanelHeight()
+}
 const pendingTaskCount = computed(() => Math.max(0, taskStore.taskQueue.length - 1))
 let revealTimer: number | undefined
 let focusTimer: number | undefined
@@ -47,10 +54,13 @@ function focusVisibleControl() {
   else inputBoxRef.value?.focus()
 }
 
-function syncVisiblePanelHeight() {
-  if (props.task) void setPanelHeight(TASK_PANEL_HEIGHT)
-  else inputBoxRef.value?.syncHeight()
+async function syncVisiblePanelHeight() {
+  await nextTick()
+  if (props.task) await setPanelHeight(taskCardRef.value?.getPreferredHeight() ?? 240)
+  else await inputBoxRef.value?.syncHeight()
 }
+
+defineExpose({ syncVisiblePanelHeight })
 
 function playPanelReveal(options: PanelRevealPayload = { focus: false }) {
   window.clearTimeout(revealTimer)
@@ -74,12 +84,14 @@ function playPanelReveal(options: PanelRevealPayload = { focus: false }) {
 }
 
 onMounted(async () => {
+  window.addEventListener('resize', handlePanelResize)
   syncVisiblePanelHeight()
   publishPanelActivity()
   removeRevealListener = await listen<PanelRevealPayload>(PANEL_REVEAL_EVENT, (event) => {
     playPanelReveal(event.payload)
   })
   removeSessionClearedListener = await listen('desktop-session-cleared', async () => {
+    operationGeneration += 1
     submitError.value = ''
     loading.value = false
     await nextTick()
@@ -88,6 +100,8 @@ onMounted(async () => {
 })
 
 onUnmounted(() => {
+  operationGeneration += 1
+  window.removeEventListener('resize', handlePanelResize)
   window.clearTimeout(revealTimer)
   window.clearTimeout(focusTimer)
   window.cancelAnimationFrame(revealFrame ?? 0)
@@ -95,7 +109,7 @@ onUnmounted(() => {
   removeSessionClearedListener?.()
 })
 
-watch(() => props.task, async () => {
+watch(() => [props.task?.eventId, props.task?.error, props.task?.payload.title, props.task?.payload.content], async () => {
   publishPanelActivity()
   await nextTick()
   syncVisiblePanelHeight()
@@ -111,7 +125,7 @@ function publishPanelActivity() {
   const activity = {
     // A visible task is active panel content and must not be treated like an
     // empty draft by the native idle-hide policy.
-    hasText: panelHasText.value || Boolean(props.task),
+    hasText: panelHasText.value || panelComposing.value || Boolean(props.task),
     focused: panelFocused.value,
   }
   void setPanelActivity(activity)
@@ -131,19 +145,26 @@ function handleFocusChange(focused: boolean) {
   publishPanelActivity()
 }
 
-function handleHeightChange(height: number) {
-  if (!props.task) void setPanelHeight(height)
+async function prepareInputHeight(height: number) {
+  if (!props.task) await setPanelHeight(height)
+}
+
+function handleCompositionChange(composing: boolean) {
+  panelComposing.value = composing
+  publishPanelActivity()
 }
 
 async function submitTodo(text: string) {
   if (loading.value) return
 
+  const operation = ++operationGeneration
   submitError.value = ''
   loading.value = true
   try {
     const opened = await openWorkbench({ todoText: text })
+    if (operation !== operationGeneration) return
     if (!opened) {
-      submitError.value = '未能打开工作台，请检查默认浏览器后重试。'
+      submitError.value = '未确认工作台是否打开，请先检查浏览器。当前内容已保留。'
       return
     }
 
@@ -151,13 +172,15 @@ async function submitTodo(text: string) {
     const hidden = await hidePanelWindow()
     if (hidden) showMascotMessage('已打开工作台', 'success', true)
   } catch {
-    submitError.value = '未能打开工作台，请检查默认浏览器后重试。'
+    if (operation !== operationGeneration) return
+    submitError.value = '未确认工作台是否打开，请先检查浏览器。当前内容已保留。'
   } finally {
+    if (operation !== operationGeneration) return
     loading.value = false
     if (submitError.value) {
       await nextTick()
       inputBoxRef.value?.syncHeight()
-      inputBoxRef.value?.focus()
+
     }
   }
 }
@@ -191,10 +214,12 @@ async function handleTaskAction(eventId: string, taskId: string, action: TaskAct
       ref="inputBoxRef"
       :loading="loading"
       :error="submitError"
+      :prepare-height="prepareInputHeight"
       @submit="submitTodo"
       @draft-change="handleDraftChange"
       @focus-change="handleFocusChange"
-      @height-change="handleHeightChange"
+      @composition-change="handleCompositionChange"
+      @dismiss="hidePanelWindow"
     />
     <span class="pet-prompt__tail" aria-hidden="true" />
   </section>

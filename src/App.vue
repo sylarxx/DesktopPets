@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import type { UnlistenFn } from '@tauri-apps/api/event'
 import { emitTo, listen } from '@tauri-apps/api/event'
 import MascotWindow from './views/MascotWindow.vue'
@@ -33,6 +33,7 @@ import {
   MASCOT_CONTEXT_MENU_VISIBILITY_EVENT,
   MASCOT_SYSTEM_NOTIFICATION_ACTION_EVENT,
   MASCOT_SYSTEM_NOTIFICATION_PRESENT_EVENT,
+  MASCOT_SYSTEM_NOTIFICATION_LAYOUT_EVENT,
   MASCOT_SYSTEM_NOTIFICATION_READY_EVENT,
   hideMascotSystemNotificationWindow,
   hidePanelWindow,
@@ -61,6 +62,7 @@ import type { SysMessageNotification } from './types/sys-message'
 import type { TaskCreatedEvent } from './types/task'
 import { env } from './utils/env'
 import { storage } from './utils/storage'
+import { createNotificationDelivery } from './utils/notification-delivery'
 import {
   SYS_MESSAGE_EXPIRY_MS,
   isSysMessageExpired,
@@ -113,6 +115,7 @@ let removeMascotMessageListener: (() => void) | undefined
 let removeSysMessageListener: (() => void) | undefined
 let removeSystemNotificationActionListener: UnlistenFn | undefined
 let removeSystemNotificationReadyListener: UnlistenFn | undefined
+let removeSystemNotificationLayoutListener: UnlistenFn | undefined
 let removeContextMenuVisibilityListener: UnlistenFn | undefined
 let removeDeepLinkListener: UnlistenFn | undefined
 let removeUnauthorizedListener: (() => void) | undefined
@@ -134,6 +137,35 @@ let systemNotificationMessageKey = ''
 let userHiddenSystemNotificationKey = ''
 const systemNotificationWindowReady = ref(false)
 const contextMenuWindowVisible = ref(false)
+const visibleSystemNotification = ref<MascotSystemNotificationPresentation | null>(null)
+const systemMessageWindowVisible = computed(() =>
+  visibleSystemNotification.value?.kind === 'message'
+  && visibleSystemNotification.value.message.dedupeKey === currentSysMessage.value?.dedupeKey
+  && !contextMenuWindowVisible.value
+  && !needsAuth.value
+)
+const notificationDelivery = createNotificationDelivery<MascotSystemNotificationPresentation>({
+  nextGeneration: () => ++systemNotificationSyncGeneration,
+  publish: (delivery) => emitTo(
+    'mascot-notification', MASCOT_SYSTEM_NOTIFICATION_PRESENT_EVENT, delivery,
+  ),
+  async show(syncGeneration, presentation) {
+    const mascotShown = await showNotificationWindow()
+    if (!mascotShown || syncGeneration !== systemNotificationSyncGeneration) return false
+    const notificationShown = await showMascotSystemNotificationWindow(
+      presentation.kind === 'auth',
+      syncGeneration,
+    )
+    recordDesktopDiagnostic('notification.sync.completed', {
+      kind: presentation.kind, mascotShown, notificationShown, generation: syncGeneration,
+    })
+    return notificationShown
+  },
+  hide: (generation) => hideMascotSystemNotificationWindow(generation),
+  key: (presentation) => presentation.kind === 'auth' ? 'auth' : presentation.message.dedupeKey,
+  onStopped: () => mascotStore.showMessage('提醒暂未显示，消息已保留，可在工作台查看', 'idle', true),
+  onVisible: (presentation) => { visibleSystemNotification.value = presentation },
+})
 let isDeliveringDeferredTasks = false
 const panelTaskStateReady = ref(false)
 const deferredTaskEvents: TaskCreatedEvent[] = []
@@ -169,6 +201,7 @@ let awaitingTaskDelivery: PanelTaskDeliveredPayload | null = null
 let taskDeliveryRetryTimer: number | undefined
 let taskDeliveryFailureEventId = ''
 
+const panelWindowRef = ref<InstanceType<typeof PanelWindow> | null>(null)
 const currentTask = computed(() => taskStore.currentTask)
 const sysMessageUserId = computed(() => userStore.userInfo?.userId || env.desktopUserId || env.mockUserId)
 const needsAuth = computed(
@@ -440,11 +473,17 @@ function showIncomingSysMessage(message: ResolvedSysMessage) {
   // A genuinely new reminder is allowed to wake an explicitly hidden
   // assistant. Do this before queue mutation so the reactive sync observes the
   // cleared suppression even when another message is currently at the head.
-  userHiddenSystemNotificationKey = ''
-  void emitTo('mascot', 'mascot-close-overlays', {})
+  if (!message.attentionKey || !currentSysMessage.value) {
+    userHiddenSystemNotificationKey = ''
+    void emitTo('mascot', 'mascot-close-overlays', {})
+  }
 
   if (currentSysMessage.value) {
     sysMessageQueue.value.push(message)
+    if (message.attentionKey) {
+      sysMessageQueue.value.sort((a, b) => a.expiresAt - b.expiresAt)
+      return true
+    }
   } else {
     sysMessageActionError.value = ''
     currentSysMessage.value = message
@@ -564,15 +603,19 @@ async function handleSysMessageRead(message: SysMessageNotification) {
     return
   }
 
+  const actionSession = sysMessageEnrichmentGeneration
   sysMessageActionError.value = ''
   sysMessageReadPendingKey.value = message.dedupeKey
   try {
     await sysMessageService.markRead(message)
+    if (actionSession !== sysMessageEnrichmentGeneration) return
     hideCurrentSysMessage(message)
   } catch (error) {
+    if (actionSession !== sysMessageEnrichmentGeneration) return
     console.warn('Failed to mark sys_message as read', error)
     sysMessageActionError.value = '未能标记已读，请检查网络后重试'
   } finally {
+    if (actionSession !== sysMessageEnrichmentGeneration) return
     if (sysMessageReadPendingKey.value === message.dedupeKey) {
       sysMessageReadPendingKey.value = ''
     }
@@ -589,6 +632,7 @@ async function handleAllSysMessagesRead() {
   if (snapshot.length < 2) return
 
   const snapshotKeys = new Set(snapshot.map((message) => message.dedupeKey))
+  const actionSession = sysMessageEnrichmentGeneration
   sysMessageActionError.value = ''
   sysMessageReadAllPending.value = true
   try {
@@ -596,6 +640,7 @@ async function handleAllSysMessagesRead() {
       await sysMessageService.markAllRead(snapshot)
     }
 
+    if (actionSession !== sysMessageEnrichmentGeneration) return
     const remainingMessages = [
       ...(currentSysMessage.value && !snapshotKeys.has(currentSysMessage.value.dedupeKey)
         ? [currentSysMessage.value]
@@ -610,9 +655,11 @@ async function handleAllSysMessagesRead() {
       void deliverTasksWhenSystemMessagesFinish()
     }
   } catch (error) {
+    if (actionSession !== sysMessageEnrichmentGeneration) return
     console.warn('Failed to mark all sys_messages as read', error)
     sysMessageActionError.value = '未能全部标为已读，消息已保留，请稍后重试'
   } finally {
+    if (actionSession !== sysMessageEnrichmentGeneration) return
     sysMessageReadAllPending.value = false
   }
 }
@@ -625,10 +672,12 @@ async function handleSysMessageView(message: SysMessageNotification) {
     return
   }
 
+  const actionSession = sysMessageEnrichmentGeneration
   sysMessageActionError.value = ''
   sysMessageReadPendingKey.value = message.dedupeKey
   try {
     const opened = await openSysMessageDetail(message)
+    if (actionSession !== sysMessageEnrichmentGeneration) return
     if (!opened) {
       sysMessageActionError.value = '未能打开详情，请检查默认浏览器后重试'
       return
@@ -644,13 +693,16 @@ async function handleSysMessageView(message: SysMessageNotification) {
     try {
       await sysMessageService.markRead(message)
     } catch (error) {
+      if (actionSession !== sysMessageEnrichmentGeneration) return
       console.warn('Failed to mark viewed sys_message as read', error)
       sysMessageActionError.value = '详情已打开，但未能标记已读；可点击“知道了”重试'
       return
     }
 
+    if (actionSession !== sysMessageEnrichmentGeneration) return
     hideCurrentSysMessage(message)
   } finally {
+    if (actionSession !== sysMessageEnrichmentGeneration) return
     if (sysMessageReadPendingKey.value === message.dedupeKey) {
       sysMessageReadPendingKey.value = ''
     }
@@ -694,15 +746,7 @@ function buildSystemNotificationPresentation(): MascotSystemNotificationPresenta
 }
 
 async function syncSystemNotificationWindow() {
-  if (windowMode !== 'mascot' || !systemNotificationWindowReady.value) {
-    recordDesktopDiagnostic('notification.sync.skipped', {
-      windowMode,
-      notificationWindowReady: systemNotificationWindowReady.value,
-    })
-    return
-  }
-
-  const syncGeneration = ++systemNotificationSyncGeneration
+  if (windowMode !== 'mascot') return
   const presentation = buildSystemNotificationPresentation()
   if (!presentation) systemNotificationMessageKey = ''
   if (!presentation) userHiddenSystemNotificationKey = ''
@@ -711,37 +755,15 @@ async function syncSystemNotificationWindow() {
     && systemNotificationMessageKey
     && systemNotificationMessageKey === userHiddenSystemNotificationKey
   )
-  await emitTo(
-    'mascot-notification',
-    MASCOT_SYSTEM_NOTIFICATION_PRESENT_EVENT,
-    suppressedByUserHide ? null : presentation,
+  // Preserve this intent even when ready has not arrived yet. Delivery waits
+  // for the card's layout ACK and retries native failures without a new message.
+  notificationDelivery.sync(
+    suppressedByUserHide || contextMenuWindowVisible.value ? null : presentation,
   )
-  if (syncGeneration !== systemNotificationSyncGeneration) return
   if (!presentation || suppressedByUserHide) {
-    // Native visibility is the final authority. Do not depend solely on a Vue
-    // after-leave callback: a suspended WebView2 renderer could otherwise leave
-    // a transparent always-on-top window intercepting clicks after the card is
-    // gone.
-    const hidden = await hideMascotSystemNotificationWindow(syncGeneration)
     recordDesktopDiagnostic('notification.sync.hidden', {
-      success: hidden,
-      generation: syncGeneration,
+      generation: systemNotificationSyncGeneration,
       reason: suppressedByUserHide ? 'user-hide' : 'no-presentation',
-    })
-    return
-  }
-  if (presentation && !contextMenuWindowVisible.value) {
-    const mascotShown = await showNotificationWindow()
-    if (syncGeneration !== systemNotificationSyncGeneration) return
-    const notificationShown = await showMascotSystemNotificationWindow(
-      presentation.kind === 'auth',
-      syncGeneration,
-    )
-    recordDesktopDiagnostic('notification.sync.completed', {
-      kind: presentation.kind,
-      mascotShown,
-      notificationShown,
-      generation: syncGeneration,
     })
   }
 }
@@ -840,6 +862,7 @@ function resetSessionUnauthorizedEvidence() {
 }
 
 function clearDesktopSession(message: string, status: MascotStatus = 'remind') {
+  notificationDelivery.reset()
   recordDesktopDiagnostic('session.clear_requested', {
     status,
     tokenPresent: Boolean(userStore.token),
@@ -1099,6 +1122,10 @@ onMounted(async () => {
       MASCOT_SYSTEM_NOTIFICATION_ACTION_EVENT,
       (event) => handleSystemNotificationAction(event.payload),
     )
+    removeSystemNotificationLayoutListener = await listen<{ generation: number }>(
+      MASCOT_SYSTEM_NOTIFICATION_LAYOUT_EVENT,
+      (event) => notificationDelivery.acknowledge(event.payload.generation),
+    )
     removeSystemNotificationReadyListener = await listen(
       MASCOT_SYSTEM_NOTIFICATION_READY_EVENT,
       () => {
@@ -1119,11 +1146,11 @@ onMounted(async () => {
           wasVisible,
         })
         if (visible) {
-          const hideGeneration = ++systemNotificationSyncGeneration
-          void hideMascotSystemNotificationWindow(hideGeneration)
+          notificationDelivery.sync(null)
         }
         if (!visible && !restoreNotification) {
           userHiddenSystemNotificationKey = systemNotificationMessageKey
+          notificationDelivery.sync(null)
           recordDesktopDiagnostic('interaction.context_menu.hide_intent', {
             presentationKind: systemNotificationMessageKey === 'auth'
               ? 'auth'
@@ -1135,11 +1162,12 @@ onMounted(async () => {
         if (wasVisible && !visible && restoreNotification) void syncSystemNotificationWindow()
       },
     )
-    systemNotificationWindowReady.value = await isMascotSystemNotificationReady()
+    const nativeNotificationReady = await isMascotSystemNotificationReady()
+    systemNotificationWindowReady.value ||= nativeNotificationReady
     recordDesktopDiagnostic('notification.native_ready_checked', {
       ready: systemNotificationWindowReady.value,
     })
-    if (systemNotificationWindowReady.value) void syncSystemNotificationWindow()
+    void syncSystemNotificationWindow()
 
     removePanelTaskDeliveredListener = await listen<PanelTaskDeliveredPayload>(
       PANEL_TASK_DELIVERED_EVENT,
@@ -1203,6 +1231,10 @@ onMounted(async () => {
         })
         // 登录卡消失时直接恢复普通窗口，避免 Windows 在“大卡片 -> 小气泡”
         // 连续缩放中出现窗口尺寸与 WebView 渲染尺寸不同步。
+        const previousUserId = userStore.userInfo?.userId
+        if (previousUserId && previousUserId !== payload.userInfo.userId) {
+          clearDesktopSession('', 'idle')
+        }
         mascotStore.resetStatus()
         userStore.setSession(payload)
         recordDesktopDiagnostic('auth.callback.session_committed', {
@@ -1220,8 +1252,7 @@ onMounted(async () => {
         // Hide the native login surface immediately. The regular reactive sync
         // will publish the next system message if one is queued, but a delayed
         // WebView2 paint can no longer leave the old login card on screen.
-        const hideGeneration = ++systemNotificationSyncGeneration
-        void hideMascotSystemNotificationWindow(hideGeneration)
+        notificationDelivery.sync(null)
         connectDesktopSockets({ force: true })
         startSessionValidation()
         if (releaseSmokePrepared) queueDesktopReleaseSmokeReminders()
@@ -1251,6 +1282,9 @@ onMounted(async () => {
         // Store synchronously, then ask the mascot-side coordinator to reveal.
         // The coordinator alone knows whether a system-message card is active.
         taskStore.pushTask(delivery.event)
+        await nextTick()
+        await panelWindowRef.value?.syncVisiblePanelHeight()
+        if (panelSessionEpoch.value !== delivery.sessionEpoch) return
         try {
           const ack: PanelTaskDeliveredPayload = {
             eventId: delivery.event.eventId,
@@ -1314,6 +1348,8 @@ onUnmounted(() => {
   removeSysMessageListener?.()
   removeSystemNotificationActionListener?.()
   removeSystemNotificationReadyListener?.()
+  removeSystemNotificationLayoutListener?.()
+  notificationDelivery.dispose()
   removeContextMenuVisibilityListener?.()
   removeDeepLinkListener?.()
   removeUnauthorizedListener?.()
@@ -1334,11 +1370,12 @@ onUnmounted(() => {
       v-if="windowMode === 'mascot'"
       :needs-auth="needsAuth"
       :sys-message="currentSysMessage"
+      :system-message-visible="systemMessageWindowVisible"
       @login="startDesktopLogin"
       @ready="handleMascotInteractionReady"
     />
     <MascotMenuWindow v-else-if="windowMode === 'mascot-menu'" />
     <MascotNotificationWindow v-else-if="windowMode === 'mascot-notification'" />
-    <PanelWindow v-else :socket-status="socketStatus" :mock-enabled="env.enableMock" :task="currentTask" />
+    <PanelWindow v-else ref="panelWindowRef" :socket-status="socketStatus" :mock-enabled="env.enableMock" :task="currentTask" />
   </main>
 </template>

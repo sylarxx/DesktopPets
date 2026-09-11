@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import { readFileSync } from 'node:fs'
 import appSource from '../App.vue?raw'
+import deliverySource from './notification-delivery.ts?raw'
 import authLoginTipSource from '../components/AuthLoginTip.vue?raw'
 import taskCardSource from '../components/TaskPushCard.vue?raw'
 import sysMessageTipSource from '../components/SysMessageTip.vue?raw'
@@ -175,8 +176,7 @@ describe('notification and task production contracts', () => {
       authCallback,
       'userStore.setSession(payload)',
       'stopAuthCallbackTimer()',
-      'const hideGeneration = ++systemNotificationSyncGeneration',
-      'void hideMascotSystemNotificationWindow(hideGeneration)',
+      'notificationDelivery.sync(null)',
       'connectDesktopSockets({ force: true })',
     )
     expectInOrder(mascotToggle, 'if (props.needsAuth)', "emit('login')", 'canOpenMascotTodoPanel(false')
@@ -312,7 +312,10 @@ describe('notification and task production contracts', () => {
       visible: false,
       resizable: false,
     })
-    expectInOrder(sync, "emitTo( 'mascot-notification'", 'await showNotificationWindow()', "await showMascotSystemNotificationWindow( presentation.kind === 'auth', syncGeneration, )")
+    const delivery = section(appSource, 'const notificationDelivery =', 'let isDeliveringDeferredTasks')
+    expectInOrder(delivery, "emitTo( 'mascot-notification'", 'await showNotificationWindow()', "await showMascotSystemNotificationWindow( presentation.kind === 'auth', syncGeneration, )")
+    expect(sync).toContain('notificationDelivery.sync(')
+    expectInOrder(deliverySource, 'const ready = await waitForLayout', 'if (!isCurrent(token)) return', 'if (ready) success = await options.show')
     expect(mascotWindowSource).toContain('() => props.needsAuth')
     expect(appSource).toContain("kind: 'auth'")
     expect(appSource).toContain("kind: 'message'")
@@ -326,8 +329,19 @@ describe('notification and task production contracts', () => {
     expect(nativeShow).toContain('get_webview_window("mascot-notification")')
     expect(nativeShow).toContain('position_mascot_system_notification_window')
     expect(nativeShow).toContain('show_interactive_window(&notification, false)')
-    expect(sync).toContain('await hideMascotSystemNotificationWindow(syncGeneration)')
+    expect(delivery).toContain('hide: (generation) => hideMascotSystemNotificationWindow(generation)')
     expect(mascotNotificationWindowSource).not.toContain('hideMascotSystemNotificationWindow')
+  })
+
+  it('ACKs committed card layout without a hidden-window transition and gates waving on display', () => {
+    const apply = section(mascotNotificationWindowSource, 'async function applyPresentation', 'async function announceReady')
+    expectInOrder(apply, 'delivery.generation <= deliveryGeneration', 'presentation.value = delivery.presentation', 'await nextTick()', 'delivery.generation !== deliveryGeneration', 'getBoundingClientRect()', 'bounds.width <= 0', "await emitTo('mascot', MASCOT_SYSTEM_NOTIFICATION_LAYOUT_EVENT")
+    expect(mascotNotificationWindowSource).not.toContain('<Transition')
+    expect(mascotNotificationWindowSource).not.toContain('requestAnimationFrame(')
+    expect(appSource).toContain('notificationDelivery.acknowledge(event.payload.generation)')
+    expect(appSource).toContain(':system-message-visible="systemMessageWindowVisible"')
+    expect(mascotWindowSource).toContain("props.sysMessage && props.systemMessageVisible && waveCycles.value > 0 ? 'waving'")
+    expect(appSource).toContain('visibleSystemNotification.value.message.dedupeKey === currentSysMessage.value?.dedupeKey')
   })
 
   it('keeps the detached system card attached to the mascot throughout native dragging', () => {
@@ -479,7 +493,9 @@ describe('notification and task production contracts', () => {
     expectInOrder(safeShow, 'set_ignore_cursor_events(false)', 'show_window_without_activation')
     expectInOrder(nativeHide, 'state.request_hide(client_generation)', 'state.transition.lock()', 'state.can_hide(generation)', 'hide_transparent_window_safely(&window)', 'state.mark_physical_hidden()')
     expectInOrder(nativeShow, 'state.request_show(compact, client_generation)', 'state.transition.lock()', 'state.can_show(generation, compact)', 'position_mascot_system_notification_window', 'show_interactive_window(&notification, false)', 'state.mark_visible(generation, compact)')
-    expectInOrder(sync, 'const syncGeneration = ++systemNotificationSyncGeneration', 'if (!presentation)', 'await hideMascotSystemNotificationWindow(syncGeneration)', 'return')
+    expectInOrder(sync, 'if (!presentation)', 'notificationDelivery.sync(', 'suppressedByUserHide || contextMenuWindowVisible.value ? null : presentation')
+    expectInOrder(deliverySource, 'if (presentation === null)', 'const generation = options.nextGeneration()', 'options.hide(generation)', 'options.publish({ generation, presentation: null })')
+    expect(appSource).toContain('nextGeneration: () => ++systemNotificationSyncGeneration')
     expect(appSource).toContain('let systemNotificationSyncGeneration = Date.now() * 1000')
   })
 

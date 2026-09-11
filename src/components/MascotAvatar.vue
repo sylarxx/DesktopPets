@@ -10,7 +10,16 @@ import type { RunningDirection } from '../utils/mascot-drag-motion'
 const props = defineProps<{
   status: MascotStatus
   animationState?: MascotAnimationState
+  waveKey?: string
 }>()
+
+const emit = defineEmits<{ waveCycle: []; activate: [] }>()
+
+function handleKeydown(event: KeyboardEvent) {
+  if ((event.key !== 'Enter' && event.key !== ' ') || event.repeat || event.isComposing) return
+  event.preventDefault()
+  emit('activate')
+}
 
 type SpriteSheetName = 'main' | 'running' | 'peek'
 
@@ -183,7 +192,11 @@ watch(runningDirection, (direction, previousDirection) => {
 // Recreate a state sprite atomically so its timeline starts at frame zero. Both
 // running directions deliberately share one key, preserving gait phase when a
 // drag reverses. There is never an old and new sprite in the DOM together.
-const spriteElementKey = computed(() => runningDirection.value ? 'running' : resolvedState.value)
+const spriteElementKey = computed(() => {
+  if (runningDirection.value) return 'running'
+  if (resolvedState.value === 'waving') return `waving:${props.waveKey ?? ''}`
+  return resolvedState.value
+})
 
 const spriteStyle = computed(() => {
   const sprite = spriteStates[resolvedState.value] ?? spriteStates.idle
@@ -232,6 +245,7 @@ onBeforeUnmount(() => {
     ]"
     type="button"
     aria-label="单击打开输入框，双击打开工作台"
+    @keydown="handleKeydown"
   >
     <span class="status-orbit" />
     <span class="mascot-sprite-stage">
@@ -239,6 +253,7 @@ onBeforeUnmount(() => {
         :key="spriteElementKey"
         class="mascot-sprite mascot-sprite--single"
         :style="spriteStyle"
+        @animationiteration="resolvedState === 'waving' && emit('waveCycle')"
         aria-hidden="true"
       />
     </span>

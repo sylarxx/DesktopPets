@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 const mocks = vi.hoisted(() => ({
   invoke: vi.fn(),
@@ -37,6 +37,7 @@ import {
 } from './window.service'
 
 describe('external window opening', () => {
+  afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals() })
   beforeEach(() => {
     vi.clearAllMocks()
     vi.stubGlobal('window', {
@@ -90,10 +91,28 @@ describe('external window opening', () => {
     await expect(openExternal('https://workbench.example.com/calendar')).resolves.toBe(true)
     expect(openedWindow.opener).toBeNull()
   })
+  it('releases a hung browser handoff without opening a second tab after timeout', async () => {
+    vi.useFakeTimers()
+    let finish!: (value: boolean) => void
+    mocks.invoke.mockImplementationOnce(() => new Promise(resolve => { finish = resolve }))
+    const outcome = expect(openExternal('https://workbench.example.com/workbench')).resolves.toBe(false)
+    await vi.advanceTimersByTimeAsync(12_000)
+    await outcome
+    finish(false)
+    await vi.advanceTimersByTimeAsync(0)
+    expect(mocks.openUrl).not.toHaveBeenCalled()
+    expect(mocks.windowOpen).not.toHaveBeenCalled()
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
 })
 
 describe('background task panel reveal', () => {
-  beforeEach(() => vi.clearAllMocks())
+  beforeEach(() => {
+    vi.clearAllMocks()
+    vi.stubGlobal('window', { dispatchEvent: vi.fn() })
+  })
+  afterEach(() => vi.unstubAllGlobals())
 
   it('returns false and does not emit a reveal when native positioning fails', async () => {
     mocks.invoke.mockResolvedValue(false)

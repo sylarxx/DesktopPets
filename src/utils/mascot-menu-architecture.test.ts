@@ -171,7 +171,7 @@ describe('mascot context menu architecture', () => {
     const notificationRestore = sourceBetween(
       appSource,
       'removeContextMenuVisibilityListener = await listen<MascotMenuVisibilityPayload>',
-      'systemNotificationWindowReady.value = await isMascotSystemNotificationReady()',
+      'const nativeNotificationReady = await isMascotSystemNotificationReady()',
     )
     expect(windowServiceSource).toMatch(
       /interface MascotMenuVisibilityPayload\s*\{[\s\S]*?visible: boolean[\s\S]*?restoreNotification: boolean[\s\S]*?\}/,
@@ -179,6 +179,7 @@ describe('mascot context menu architecture', () => {
     expect(notificationRestore).toContain('const { visible, restoreNotification } = event.payload')
     expect(notificationRestore).toContain('if (!visible && !restoreNotification)')
     expect(notificationRestore).toContain('userHiddenSystemNotificationKey = systemNotificationMessageKey')
+    expect(notificationRestore).toContain('notificationDelivery.sync(null)')
     expect(notificationRestore).toContain('if (wasVisible && !visible && restoreNotification)')
     expect(appSource).toContain('systemNotificationMessageKey === userHiddenSystemNotificationKey')
     expect(appSource).toContain("reason: suppressedByUserHide ? 'user-hide' : 'no-presentation'")

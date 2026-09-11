@@ -47,6 +47,7 @@ import {
 const props = defineProps<{
   needsAuth: boolean
   sysMessage: SysMessageNotification | null
+  systemMessageVisible: boolean
 }>()
 
 const emit = defineEmits<{
@@ -383,6 +384,7 @@ function togglePanel() {
     return
   }
   if (!canOpenMascotTodoPanel(false, Boolean(props.sysMessage))) return
+  if (panelVisible.value && panelHasText.value) return
 
   dismissTransientOverlays()
   playTransientAnimation('waiting', mascotWaitingInteractionMs)
@@ -489,7 +491,10 @@ function handlePointerMove(event: PointerEvent) {
   dragState.lastScreenX = event.screenX
 
   const startedDragging = !dragState.dragging
-  if (startedDragging) clearAvatarClickSequence()
+  if (startedDragging) {
+    clearAvatarClickSequence()
+    waveCycles.value = 0
+  }
   dragState.dragging = true
   isDragging.value = true
   updateRunningMotion(startedDragging ? deltaX : incrementalDeltaX, startedDragging)
@@ -575,7 +580,7 @@ async function handleContextMenu(event: MouseEvent) {
   }
   // Keep the mascot visible while the detached menu performs its first-load
   // handshake. Native visibility is the only authority that flips this state.
-  void hidePanelWindow()
+  if (!panelHasText.value) void hidePanelWindow()
   if (!await showMascotContextMenu()) {
     refreshIdleHideSchedule()
     void releaseDismissedNotificationLayout()
@@ -588,6 +593,15 @@ const usesCompactNotificationLayout = computed(
   () => hasBubbleMessage.value
     || isBubbleMessageDismissing.value
 )
+const waveCycles = ref(0)
+const wavedMessageKeys = new Set<string>()
+watch(() => props.systemMessageVisible && (props.sysMessage?.attentionKey || props.sysMessage?.dedupeKey), (key) => {
+  if (!key || wavedMessageKeys.has(key)) return
+  wavedMessageKeys.add(key)
+  waveCycles.value = prefersReducedMotion() || isDragging.value ? 0 : 2
+})
+function completeWaveCycle() { waveCycles.value = Math.max(0, waveCycles.value - 1) }
+
 const avatarAnimationState = computed<MascotAnimationState | undefined>(() => {
   if (previewAnimationState) return previewAnimationState
   if (peekTransition.value === 'revealing') {
@@ -599,7 +613,8 @@ const avatarAnimationState = computed<MascotAnimationState | undefined>(() => {
   if (peekTransition.value === 'peeking' || isPeeked.value) {
     return peekSide.value === 'left' ? 'peeking-left' : 'peeking'
   }
-  return props.sysMessage ? 'waving' : animationState.value
+  if (isDragging.value) return animationState.value
+  return props.sysMessage && props.systemMessageVisible && waveCycles.value > 0 ? 'waving' : animationState.value
 })
 const isNotifying = computed(
   () => usesCompactNotificationLayout.value
@@ -680,7 +695,11 @@ watch(
 watch(
   () => props.needsAuth,
   (needsAuth) => {
-    if (needsAuth) void hidePanelWindow()
+    if (needsAuth) {
+      wavedMessageKeys.clear()
+      waveCycles.value = 0
+      void hidePanelWindow()
+    }
     refreshIdleHideSchedule()
   }
 )
@@ -835,6 +854,9 @@ onUnmounted(() => {
     <MascotAvatar
       :status="mascotStore.status"
       :animation-state="avatarAnimationState"
+      :wave-key="sysMessage?.attentionKey || sysMessage?.dedupeKey"
+      @wave-cycle="completeWaveCycle"
+      @activate="togglePanel"
     />
   </section>
 </template>

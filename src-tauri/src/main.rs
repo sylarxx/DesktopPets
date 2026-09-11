@@ -100,13 +100,14 @@ struct MascotSystemNotificationState {
 }
 
 impl MascotSystemNotificationState {
-    fn mark_ready(&self) -> Result<(), String> {
+    fn mark_ready(&self) -> Result<bool, String> {
         let mut status = self
             .status
             .lock()
             .map_err(|_| "mascot system notification state is unavailable".to_string())?;
+        let first_ready = !status.ready;
         status.ready = true;
-        Ok(())
+        Ok(first_ready)
     }
 
     fn is_ready(&self) -> bool {
@@ -523,6 +524,13 @@ impl PanelActivityState {
         if let Ok(mut activity) = self.0.lock() {
             *activity = PanelActivity { has_text, focused };
         }
+    }
+
+    fn has_content(&self) -> bool {
+        self.0
+            .lock()
+            .map(|activity| activity.has_text)
+            .unwrap_or(true)
     }
 
     fn is_engaged(&self) -> bool {
@@ -988,7 +996,7 @@ const MASCOT_MESSAGE_WIDTH: f64 = 240.0;
 const MASCOT_MESSAGE_HEIGHT: f64 = 176.0;
 const PANEL_WIDTH: f64 = 380.0;
 const PANEL_COMPACT_HEIGHT: f64 = 78.0;
-const PANEL_MAX_HEIGHT: f64 = 240.0;
+const PANEL_MAX_HEIGHT: f64 = 380.0;
 const SCREEN_MARGIN: f64 = 24.0;
 const MASCOT_REST_RIGHT_MARGIN: f64 = 30.0;
 const MASCOT_REST_BOTTOM_MARGIN: f64 = 38.0;
@@ -2284,6 +2292,52 @@ mod mascot_position_tests {
     }
 
     #[test]
+    fn detached_cards_never_cover_the_avatar_in_small_scaled_work_areas() {
+        for scale in [1.0, 1.5, 2.0] {
+            let work = PhysicalRect {
+                x: -1366,
+                y: 0,
+                width: 1366,
+                height: 728,
+            };
+            for (x, y) in [(-1300, 30), (-750, 330), (-250, 570)] {
+                let avatar = PhysicalRect {
+                    x,
+                    y,
+                    width: (92.0 * scale) as u32,
+                    height: (76.0 * scale) as u32,
+                };
+                let notification =
+                    system_notification_physical_geometry(avatar, work, scale, false);
+                let panel = panel_physical_geometry(avatar, work, scale, 380.0);
+                for (pos, size) in [
+                    (notification.position, notification.size),
+                    (panel.position, panel.size),
+                ] {
+                    assert!(pos.x >= work.x && pos.y >= work.y);
+                    assert!(pos.x + size.width as i32 <= work.x + work.width as i32);
+                    assert!(pos.y + size.height as i32 <= work.y + work.height as i32);
+                    assert!(
+                        pos.x + size.width as i32 <= avatar.x
+                            || pos.x >= avatar.x + avatar.width as i32
+                            || pos.y + size.height as i32 <= avatar.y
+                            || pos.y >= avatar.y + avatar.height as i32
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn outside_focus_preserves_content_but_not_an_empty_focused_panel() {
+        let state = PanelActivityState::default();
+        state.set(true, false);
+        assert!(state.has_content());
+        state.set(false, true);
+        assert!(!state.has_content());
+    }
+
+    #[test]
     fn context_menu_tail_stays_inside_the_nav_when_window_is_edge_clamped() {
         let work_area = PhysicalRect {
             x: 0,
@@ -2401,6 +2455,16 @@ mod mascot_position_tests {
         assert!(!state.expire_pending_show(first_show));
         assert!(state.snapshot().desired_visible);
         assert_eq!(state.snapshot().generation, latest_show);
+    }
+
+    #[test]
+    fn repeated_notification_ready_is_idempotent() {
+        let state = MascotSystemNotificationState::default();
+        assert!(state.mark_ready().unwrap());
+        let generation = state.request_show(false, Some(1)).unwrap().unwrap();
+        assert!(state.mark_visible(generation, false));
+        assert!(!state.mark_ready().unwrap());
+        assert_eq!(state.visible_compact(), Some(false));
     }
 
     #[test]
@@ -3104,41 +3168,18 @@ fn panel_physical_geometry(
     } else {
         1.0
     };
-    let work_height = f64::from(work_area.height) / scale;
-    let logical_height = fit_panel_height_to_rect(requested_height, work_height);
-    let width = logical_to_physical(PANEL_WIDTH, scale).clamp(1, i64::from(u32::MAX)) as u32;
-    let height = logical_to_physical(logical_height, scale).clamp(1, i64::from(u32::MAX)) as u32;
-    let margin = logical_to_physical(SCREEN_MARGIN, scale).max(0);
-    let work_left = i64::from(work_area.x);
-    let work_top = i64::from(work_area.y);
-    let work_right = work_left + i64::from(work_area.width);
-    let work_bottom = work_top + i64::from(work_area.height);
-    let min_x = work_left + margin;
-    let max_x = work_right - i64::from(width) - margin;
-    let min_y = work_top + margin;
-    let max_y = work_bottom - i64::from(height) - margin;
-    let avatar_center_x = i64::from(avatar.x) + i64::from(avatar.width) / 2;
-    let desired_x = avatar_center_x - i64::from(width) / 2;
-    // Anchor the panel's bottom edge to the visible avatar, not to the top of
-    // a temporarily expanded notification HWND.
-    let desired_y = i64::from(avatar.y) - i64::from(height);
-    let x = if max_x >= min_x {
-        desired_x.clamp(min_x, max_x)
-    } else {
-        work_left + (i64::from(work_area.width) - i64::from(width)) / 2
-    };
-    let y = if max_y >= min_y {
-        desired_y.clamp(min_y, max_y)
-    } else {
-        work_top + (i64::from(work_area.height) - i64::from(height)) / 2
-    };
-
+    let geometry = card_physical_geometry(
+        avatar,
+        work_area,
+        scale,
+        PANEL_WIDTH,
+        fit_panel_height_to_rect(requested_height, f64::from(work_area.height) / scale),
+        0.0,
+        SCREEN_MARGIN,
+    );
     PanelPhysicalGeometry {
-        position: PhysicalPosition {
-            x: x.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
-            y: y.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
-        },
-        size: PhysicalSize { width, height },
+        position: geometry.position,
+        size: geometry.size,
     }
 }
 
@@ -3366,57 +3407,83 @@ fn system_notification_physical_geometry(
     scale: f64,
     compact: bool,
 ) -> NotificationPhysicalGeometry {
+    card_physical_geometry(
+        avatar,
+        work_area,
+        scale,
+        MASCOT_SYSTEM_NOTIFICATION_WIDTH,
+        if compact {
+            MASCOT_AUTH_NOTIFICATION_HEIGHT
+        } else {
+            MASCOT_SYSTEM_NOTIFICATION_HEIGHT
+        },
+        MASCOT_SYSTEM_NOTIFICATION_GAP,
+        MASCOT_SYSTEM_NOTIFICATION_MARGIN,
+    )
+}
+
+// Shared placement for detached cards. Prefer the established above/below
+// positions; use a side only when neither vertical position fits. If the work
+// area cannot fit a full card anywhere, constrain its text viewport, never
+// clamp a full-height card over the avatar.
+fn card_physical_geometry(
+    avatar: PhysicalRect,
+    work_area: PhysicalRect,
+    scale: f64,
+    width: f64,
+    height: f64,
+    gap: f64,
+    margin: f64,
+) -> NotificationPhysicalGeometry {
     let scale = if scale.is_finite() && scale > 0.0 {
         scale
     } else {
         1.0
     };
-    let margin = logical_to_physical(MASCOT_SYSTEM_NOTIFICATION_MARGIN, scale).max(0);
-    let gap = logical_to_physical(MASCOT_SYSTEM_NOTIFICATION_GAP, scale).max(0);
-    let max_width = (i64::from(work_area.width) - margin * 2).max(1);
-    let max_height = (i64::from(work_area.height) - margin * 2).max(1);
-    let width = logical_to_physical(MASCOT_SYSTEM_NOTIFICATION_WIDTH, scale).clamp(1, max_width);
-    let logical_height = if compact {
-        MASCOT_AUTH_NOTIFICATION_HEIGHT
+    let margin = logical_to_physical(margin, scale).max(0);
+    let gap = logical_to_physical(gap, scale).max(0);
+    let left = i64::from(work_area.x) + margin;
+    let top = i64::from(work_area.y) + margin;
+    let right = i64::from(work_area.x) + i64::from(work_area.width) - margin;
+    let bottom = i64::from(work_area.y) + i64::from(work_area.height) - margin;
+    let width = logical_to_physical(width, scale).clamp(1, (right - left).max(1));
+    let mut height = logical_to_physical(height, scale).clamp(1, (bottom - top).max(1));
+    let avatar_left = i64::from(avatar.x);
+    let avatar_right = avatar_left + i64::from(avatar.width);
+    let avatar_top = i64::from(avatar.y);
+    let avatar_bottom = avatar_top + i64::from(avatar.height);
+    let above = (avatar_top - gap - top).max(0);
+    let below = (bottom - avatar_bottom - gap).max(0);
+    let center_x = avatar_left + i64::from(avatar.width) / 2;
+    let mut x = (center_x - width / 2).clamp(left, (right - width).max(left));
+    let y;
+    if above >= height {
+        y = avatar_top - gap - height;
+    } else if below >= height {
+        y = avatar_bottom + gap;
+    } else if right - avatar_right - gap >= width || avatar_left - gap - left >= width {
+        x = if right - avatar_right - gap >= width {
+            avatar_right + gap
+        } else {
+            avatar_left - gap - width
+        };
+        y = (avatar_top + i64::from(avatar.height) / 2 - height / 2)
+            .clamp(top, (bottom - height).max(top));
+    } else if above >= below {
+        height = height.min(above.max(1));
+        y = (avatar_top - gap - height).max(top);
     } else {
-        MASCOT_SYSTEM_NOTIFICATION_HEIGHT
-    };
-    let height = logical_to_physical(logical_height, scale).clamp(1, max_height);
-    let work_left = i64::from(work_area.x);
-    let work_top = i64::from(work_area.y);
-    let work_right = work_left + i64::from(work_area.width);
-    let work_bottom = work_top + i64::from(work_area.height);
-    let min_x = work_left + margin;
-    let max_x = work_right - width - margin;
-    let min_y = work_top + margin;
-    let max_y = work_bottom - height - margin;
-    let avatar_center_x = i64::from(avatar.x) + i64::from(avatar.width) / 2;
-    let desired_x = avatar_center_x - width / 2;
-    let x = if max_x >= min_x {
-        desired_x.clamp(min_x, max_x)
-    } else {
-        work_left + (i64::from(work_area.width) - width) / 2
-    };
-    let above_y = i64::from(avatar.y) - gap - height;
-    let below_y = i64::from(avatar.y) + i64::from(avatar.height) + gap;
-    let y = if above_y >= min_y {
-        above_y
-    } else if below_y <= max_y {
-        below_y
-    } else if max_y >= min_y {
-        above_y.clamp(min_y, max_y)
-    } else {
-        work_top + (i64::from(work_area.height) - height) / 2
-    };
-
+        height = height.min(below.max(1));
+        y = (avatar_bottom + gap).min((bottom - height).max(top));
+    }
     NotificationPhysicalGeometry {
         position: PhysicalPosition {
             x: x.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
             y: y.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
         },
         size: PhysicalSize {
-            width: width.min(i64::from(u32::MAX)) as u32,
-            height: height.min(i64::from(u32::MAX)) as u32,
+            width: width as u32,
+            height: height as u32,
         },
     }
 }
@@ -3999,7 +4066,13 @@ fn hide_panel_after_focus_moves_outside_app(app: tauri::AppHandle) {
             return;
         }
 
+        if app.state::<PanelActivityState>().has_content() {
+            return;
+        }
         if let Some(panel) = app.get_webview_window("panel") {
+            if matches!(panel.is_focused(), Ok(true)) {
+                return;
+            }
             if matches!(panel.is_visible(), Ok(true)) {
                 let _ = hide_transparent_window_safely(&panel);
                 emit_panel_visibility(&app, false);
@@ -4109,7 +4182,22 @@ fn position_mascot_system_notification_window(
         monitor.scale_factor(),
         compact,
     );
-    set_window_physical_geometry_if_changed(notification, geometry.position, geometry.size)
+    let changed = notification.outer_position().ok() != Some(geometry.position)
+        || notification.inner_size().ok() != Some(geometry.size);
+    set_window_physical_geometry_if_changed(notification, geometry.position, geometry.size)?;
+    if changed {
+        let placement = if geometry.position.y >= avatar.y + avatar.height as i32 {
+            "below"
+        } else if geometry.position.x >= avatar.x + avatar.width as i32 {
+            "right"
+        } else if geometry.position.x + geometry.size.width as i32 <= avatar.x {
+            "left"
+        } else {
+            "above"
+        };
+        let _ = notification.emit("mascot-system-notification-placement", placement);
+    }
+    Ok(())
 }
 
 fn sync_visible_mascot_system_notification_to_mascot(app: &tauri::AppHandle) {
@@ -4134,10 +4222,19 @@ fn set_mascot_system_notification_ready(
     app: tauri::AppHandle,
     state: tauri::State<'_, MascotSystemNotificationState>,
 ) -> bool {
-    if state.mark_ready().is_err() {
+    let Ok(_transition) = state.transition.lock() else {
         return false;
+    };
+    let Ok(first_ready) = state.mark_ready() else {
+        return false;
+    };
+    if first_ready {
+        if let Some(window) = app.get_webview_window("mascot-notification") {
+            let _ = hide_transparent_window_safely(&window);
+        }
+        state.mark_physical_hidden();
     }
-    hide_mascot_system_notification_native_window(&app);
+    // Re-announcing renderer readiness must never hide a successfully shown card.
     app.emit_to("mascot", MASCOT_SYSTEM_NOTIFICATION_READY_EVENT, ())
         .is_ok()
 }
@@ -4486,6 +4583,9 @@ fn start_mascot_drag(
     hover_monitor: tauri::State<'_, MascotPeekHoverMonitor>,
 ) -> Result<(), String> {
     hover_monitor.cancel();
+    if !app.state::<PanelActivityState>().has_content() {
+        hide_panel_and_notify(&app);
+    }
     hide_mascot_context_menu_window(&app);
     let window = app
         .get_webview_window("mascot")
@@ -4515,6 +4615,11 @@ fn toggle_panel_window(
         app.get_webview_window("mascot"),
     ) {
         if matches!(panel.is_visible(), Ok(true)) {
+            // Clicking the mascot is an outside click, not explicit dismissal
+            // of a draft. Esc and the Hide/Exit commands remain deliberate.
+            if app.state::<PanelActivityState>().has_content() {
+                return true;
+            }
             let _ = hide_transparent_window_safely(&panel);
             emit_panel_visibility(&app, false);
             return false;
@@ -4690,6 +4795,9 @@ fn set_mascot_notification_visible(
             // A panel may be opened while a bubble is fading. Re-anchor it only
             // after the mascot has atomically returned to collapsed bounds.
             sync_panel_if_visible(&app);
+        }
+        if !suspended_for_resize {
+            sync_visible_mascot_system_notification_to_mascot(&app);
         }
         return true;
     }

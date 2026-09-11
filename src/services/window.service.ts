@@ -6,6 +6,7 @@ import { recordDesktopDiagnostic } from './diagnostic.service'
 import type { SysMessageNotification } from '../types/sys-message'
 import { env } from '../utils/env'
 import { storage } from '../utils/storage'
+import type { NotificationDelivery } from '../utils/notification-delivery'
 
 export const MASCOT_REVEAL_EVENT = 'huali:mascot-reveal'
 export const MASCOT_NATIVE_DRAG_ENDED_EVENT = 'mascot-native-drag-ended'
@@ -21,6 +22,7 @@ export const PANEL_TASK_DELIVERED_EVENT = 'huali:panel-task-delivered'
 export const MASCOT_CONTEXT_MENU_VISIBILITY_EVENT = 'mascot-context-menu-visibility'
 export const MASCOT_SYSTEM_NOTIFICATION_READY_EVENT = 'mascot-system-notification-ready'
 export const MASCOT_SYSTEM_NOTIFICATION_PRESENT_EVENT = 'mascot-system-notification-present'
+export const MASCOT_SYSTEM_NOTIFICATION_LAYOUT_EVENT = 'mascot-system-notification-layout'
 export const MASCOT_SYSTEM_NOTIFICATION_ACTION_EVENT = 'mascot-system-notification-action'
 export type MascotDockSide = 'left' | 'right'
 
@@ -58,6 +60,8 @@ export interface MascotSystemMessagePresentation {
 export type MascotSystemNotificationPresentation =
   | MascotAuthPresentation
   | MascotSystemMessagePresentation
+
+export type MascotSystemNotificationDelivery = NotificationDelivery<MascotSystemNotificationPresentation>
 
 export type MascotSystemNotificationAction =
   | { action: 'login' }
@@ -132,38 +136,55 @@ export async function openExternal(
   url: string,
   options: { reuseExistingTab?: boolean } = {},
 ): Promise<boolean> {
-  if (options.reuseExistingTab !== false) {
-    try {
-      const reused = await invoke<boolean>('open_or_focus_web_url', {
-        url,
-        matchUrl: getWebBaseUrl()
-      })
-
-      if (reused) return true
-    } catch {
-      // Browser tab reuse is implemented by the native desktop shell when the
-      // operating system exposes a supported browser window.
-    }
-  }
-
-  try {
-    await openUrl(url)
-    return true
-  } catch {
-    try {
-      const openedWindow = window.open(url, '_blank')
-      if (!openedWindow) return false
-      // Preserve noopener semantics while still retaining the only reliable
-      // browser signal that a fallback window was actually created.
+  let expired = false
+  let timer: ReturnType<typeof setTimeout> | undefined
+  async function openOnce() {
+    if (options.reuseExistingTab !== false) {
       try {
-        openedWindow.opener = null
+        const reused = await invoke<boolean>('open_or_focus_web_url', {
+          url,
+          matchUrl: getWebBaseUrl()
+        })
+
+        if (expired) return false
+        if (reused) return true
       } catch {
-        // A created cross-origin WindowProxy is still a successful launch.
+        // Browser tab reuse is implemented by the native desktop shell when the
+        // operating system exposes a supported browser window.
       }
+    }
+
+    if (expired) return false
+    try {
+      await openUrl(url)
       return true
     } catch {
-      return false
+      if (expired) return false
+      try {
+        const openedWindow = window.open(url, '_blank')
+        if (!openedWindow) return false
+        // Preserve noopener semantics while still retaining the only reliable
+        // browser signal that a fallback window was actually created.
+        try {
+          openedWindow.opener = null
+        } catch {
+          // A created cross-origin WindowProxy is still a successful launch.
+        }
+        return true
+      } catch {
+        return false
+      }
     }
+  }
+  try {
+    return await Promise.race([
+      openOnce(),
+      new Promise<boolean>(resolve => {
+        timer = setTimeout(() => { expired = true; resolve(false) }, 12_000)
+      }),
+    ])
+  } finally {
+    if (timer !== undefined) clearTimeout(timer)
   }
 }
 
@@ -427,12 +448,16 @@ export async function setMascotNotificationVisible(
   }
 }
 
+let panelHeightQueue = Promise.resolve()
+let panelHeightRevision = 0
 export async function setPanelHeight(height: number) {
-  try {
-    await invoke('set_panel_height', { height })
-  } catch {
-    return
-  }
+  const revision = ++panelHeightRevision
+  const operation = panelHeightQueue.then(async () => {
+    if (revision !== panelHeightRevision) return
+    try { await invoke('set_panel_height', { height }) } catch { /* Browser preview has no native window. */ }
+  })
+  panelHeightQueue = operation
+  await operation
 }
 
 export async function setPanelActivity(activity: PanelActivityPayload) {
