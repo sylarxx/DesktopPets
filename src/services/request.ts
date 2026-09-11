@@ -25,6 +25,7 @@ export class DesktopRequestError extends Error {
 }
 
 interface DesktopRequestOptions {
+  timeoutMs?: number
   params?: Record<string, string | number | boolean | null | undefined>
   reportUnauthorized?: boolean
 }
@@ -80,19 +81,30 @@ async function parseResponse(response: Response) {
   }
 }
 
-async function performFetch(url: string, init: RequestInit) {
-  if (isTauri()) {
-    // Tauri's Rust HTTP client is not subject to WebView2 CORS restrictions.
-    // This is required when the packaged app talks to the company intranet API.
-    return nativeFetch(url, { ...init, connectTimeout: REQUEST_TIMEOUT })
-  }
-
+async function fetchResponse(url: string, init: RequestInit, timeoutMs = REQUEST_TIMEOUT) {
   const controller = new AbortController()
-  const timeout = window.setTimeout(() => controller.abort(), REQUEST_TIMEOUT)
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const expired = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      reject(new DesktopRequestError('连接后台服务超时，操作结果尚未确认'))
+      controller.abort()
+    }, Math.max(1, Math.min(REQUEST_TIMEOUT, timeoutMs)))
+  })
   try {
-    return await window.fetch(url, { ...init, signal: controller.signal })
+    // The deadline includes connection, headers AND body consumption. Race as
+    // well as abort: a stalled native bridge must still release the UI.
+    return await Promise.race([
+      (async () => {
+        const response = isTauri()
+          ? await nativeFetch(url, { ...init, signal: controller.signal, connectTimeout: REQUEST_TIMEOUT })
+          : await window.fetch(url, { ...init, signal: controller.signal })
+        const result = await parseResponse(response)
+        return { response, result }
+      })(),
+      expired,
+    ])
   } finally {
-    window.clearTimeout(timeout)
+    if (timer !== undefined) clearTimeout(timer)
   }
 }
 
@@ -109,12 +121,13 @@ async function send<T>(
   if (body !== undefined) headers.set('Content-Type', 'application/json')
 
   let response: Response
+  let result: BusinessResponse | undefined
   try {
-    response = await performFetch(buildRequestUrl(path, options), {
+    ;({ response, result } = await fetchResponse(buildRequestUrl(path, options), {
       method,
       headers,
       body: body === undefined ? undefined : JSON.stringify(body),
-    })
+    }, options.timeoutMs))
   } catch (error) {
     recordDesktopDiagnostic('request.transport_failed', {
       method,
@@ -132,7 +145,6 @@ async function send<T>(
     throw new DesktopRequestError(message)
   }
 
-  const result = await parseResponse(response)
   const code = typeof result?.code === 'number' ? result.code : undefined
 
   if (!response.ok || result?.success === false || (code !== undefined && code !== 200)) {

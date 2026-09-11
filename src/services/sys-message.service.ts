@@ -1,5 +1,6 @@
 import type { SysMessageNotification, SysMessagePushPayload, SysMessageStatus } from '../types/sys-message'
 import { env } from '../utils/env'
+import { isSysMessageExpired, resolveSysMessageExpiresAt } from '../utils/sys-message-expiry'
 import { request } from './request'
 import { maskDiagnosticIdentifier, recordDesktopDiagnostic } from './diagnostic.service'
 
@@ -172,41 +173,47 @@ async function pollUnreadMessages() {
   const userId = activeUserId
   polling = true
   try {
-    const payload = await request.get<unknown, SysMessagePagePayload>('/sys-message/page', {
-      params: {
-        pageNum: 1,
-        pageSize: 20,
-        msgStatus: 0,
-      },
-    })
-    const messages = (payload?.rows ?? payload?.list ?? [])
-      .map((item) => normalizeSysMessageItem(item))
-      .filter((item): item is SysMessageNotification => Boolean(item))
-
-    // A request started for a signed-out or previous user must never enqueue a
-    // notification after the desktop session has changed.
-    if (generation !== pollGeneration || userId !== activeUserId) return
-
-    recordDesktopDiagnostic('reminder.poll.succeeded', {
-      userIdMasked: maskDiagnosticIdentifier(userId),
-      messageCount: messages.length,
-      initialized: pollInitialized,
-      generation,
-    })
-
-    if (!pollInitialized) {
-      pollInitialized = true
-      const newestMessage = messages[0]
-      const shouldNotifyNewest = Boolean(newestMessage && !knownMessageIds.has(newestMessage.id))
-      messages.forEach((message) => rememberMessage(message))
-      if (newestMessage && shouldNotifyNewest) notifyMessage(newestMessage, 'poll-initial')
-      return
+    const initial = !pollInitialized
+    const startedAt = Date.now()
+    const messages: SysMessageNotification[] = []
+    const batchIds = new Set<string>()
+    // Initial catch-up is at most 5 pages / 100 rows / 10 seconds. Ordinary
+    // reconnects keep the existing poll cursor and deduplication history.
+    for (let pageNum = 1; pageNum <= (initial ? 5 : 1); pageNum += 1) {
+      const remaining = 10_000 - (Date.now() - startedAt)
+      if (remaining <= 0) break
+      const payload = await request.get<unknown, SysMessagePagePayload>('/sys-message/page', {
+        params: { pageNum, pageSize: 20, msgStatus: 0 },
+        timeoutMs: remaining,
+      })
+      if (generation !== pollGeneration || userId !== activeUserId) return
+      const page = (payload?.rows ?? payload?.list ?? [])
+        .map(normalizeSysMessageItem)
+        .filter((item): item is SysMessageNotification => Boolean(item))
+      let added = 0
+      for (const message of page) {
+        if (batchIds.has(message.id)) continue
+        batchIds.add(message.id)
+        messages.push(message)
+        added += 1
+      }
+      if (page.length < 20 || added === 0) break
     }
+    if (generation !== pollGeneration || userId !== activeUserId) return
+    pollInitialized = true
+    const attentionKey = `catch-up:${generation}:${startedAt}`
+    messages.sort((a, b) => {
+      const left = new Date(a.createTime?.replace(' ', 'T') || '').getTime()
+      const right = new Date(b.createTime?.replace(' ', 'T') || '').getTime()
+      return (Number.isFinite(left) ? left : startedAt) - (Number.isFinite(right) ? right : startedAt)
+    }).forEach((message) => {
+      if (message.msgStatus !== 0 || isSysMessageExpired(resolveSysMessageExpiresAt(message.createTime))) {
+        rememberMessage(message)
+        return
+      }
+      deliverMessage(initial ? { ...message, attentionKey } : message, initial ? 'poll-initial' : 'poll')
+    })
 
-    messages
-      .filter((message) => !knownMessageIds.has(message.id))
-      .reverse()
-      .forEach((message) => deliverMessage(message, 'poll'))
   } catch (error) {
     if (generation === pollGeneration) {
       console.warn('Sys message polling failed', error)

@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 const mocks = vi.hoisted(() => ({
   isTauri: vi.fn(),
@@ -28,6 +28,7 @@ vi.mock('../utils/storage', () => ({
 import { DesktopRequestError, onDesktopUnauthorized, request } from './request'
 
 describe('desktop request', () => {
+  afterEach(() => vi.useRealTimers())
   beforeEach(() => {
     vi.clearAllMocks()
     mocks.isTauri.mockReturnValue(true)
@@ -107,4 +108,33 @@ describe('desktop request', () => {
 
     removeListener()
   })
+  it('releases an operation when response headers arrive but the body never completes', async () => {
+    vi.useFakeTimers()
+    const text = vi.fn(() => new Promise<string>(() => {}))
+    mocks.nativeFetch.mockResolvedValue({ ok: true, status: 200, text })
+    const outcome = expect(request.put('/sys-message/read', { id: 1 }))
+      .rejects.toThrow('连接后台服务超时')
+    await vi.advanceTimersByTimeAsync(12_000)
+    await outcome
+    expect(mocks.nativeFetch).toHaveBeenCalledTimes(1)
+    expect(mocks.nativeFetch.mock.calls[0][1].signal.aborted).toBe(true)
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it('ignores a late unauthorized body after the request deadline', async () => {
+    vi.useFakeTimers()
+    let finish!: (body: string) => void
+    mocks.nativeFetch.mockResolvedValue({ ok: true, status: 200,
+      text: () => new Promise<string>(resolve => { finish = resolve }) })
+    const listener = vi.fn()
+    const remove = onDesktopUnauthorized(listener)
+    const outcome = expect(request.get('/getInfo')).rejects.toThrow('超时')
+    await vi.advanceTimersByTimeAsync(12_000)
+    await outcome
+    finish(JSON.stringify({ code: 401 }))
+    await vi.advanceTimersByTimeAsync(0)
+    expect(listener).not.toHaveBeenCalled()
+    remove()
+  })
+
 })

@@ -62,6 +62,7 @@ import { sysMessageService } from './sys-message.service'
 describe('sysMessageService', () => {
   beforeEach(() => {
     vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-07-14T10:05:00'))
     vi.stubGlobal('window', {
       location: { protocol: 'http:', host: 'tauri.localhost' },
       setInterval: globalThis.setInterval,
@@ -104,6 +105,7 @@ describe('sysMessageService', () => {
     await Promise.resolve()
 
     expect(mocks.get).toHaveBeenCalledWith('/sys-message/page', {
+      timeoutMs: 10_000,
       params: {
         pageNum: 1,
         pageSize: 20,
@@ -272,4 +274,35 @@ describe('sysMessageService', () => {
 
     removeListener()
   })
+  it('补入有效未读按时间排序，共用一次提示；半小时前消息不复活', async () => {
+    mocks.get.mockResolvedValue({ rows: [
+      { id: 3, createTime: '2026-07-14 10:04:00' },
+      { id: 1, createTime: '2026-07-14 09:34:59' },
+      { id: 2, createTime: '2026-07-14 09:36:00' },
+    ] })
+    const listener = vi.fn()
+    const remove = sysMessageService.onMessage(listener)
+    sysMessageService.connect('user')
+    await vi.advanceTimersByTimeAsync(0)
+    expect(listener.mock.calls.map(([message]) => message.id)).toEqual(['2', '3'])
+    expect(new Set(listener.mock.calls.map(([message]) => message.attentionKey)).size).toBe(1)
+    await vi.advanceTimersByTimeAsync(10_000)
+    expect(listener).toHaveBeenCalledTimes(2)
+    remove()
+  })
+
+  it('补入最多五页，服务端重复页提前结束', async () => {
+    mocks.get.mockImplementation(async (_path, options) => ({ rows: Array.from({length: 20}, (_, i) => ({
+      id: options.params.pageNum * 20 + i, createTime: '2026-07-14 10:00:00',
+    })) }))
+    sysMessageService.connect('user')
+    await vi.advanceTimersByTimeAsync(0)
+    expect(mocks.get).toHaveBeenCalledTimes(5)
+    sysMessageService.disconnect()
+    mocks.get.mockReset().mockResolvedValue({ rows: Array.from({length: 20}, (_, id) => ({ id })) })
+    sysMessageService.connect('user')
+    await vi.advanceTimersByTimeAsync(0)
+    expect(mocks.get).toHaveBeenCalledTimes(2)
+  })
+
 })

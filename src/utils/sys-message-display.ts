@@ -25,3 +25,11 @@ export function normalizeSysMessageDateTime(rawValue?: string) {
   const normalized = raw.replace(' ', 'T')
   return Number.isNaN(new Date(normalized).getTime()) ? undefined : normalized
 }
+
+/** Business type owns the color, icon and label; text is fallback only. */
+export function classifySysMessage(bizType: number | undefined, title: string) {
+  if (bizType !== undefined) return bizType === 2 ? 'meeting' : bizType === 1 ? 'todo' : 'notice'
+  if (/会议/.test(title)) return 'meeting'
+  if (/待办|任务|todo/i.test(title)) return 'todo'
+  return 'notice'
+}
