@@ -42,6 +42,7 @@ pub struct DesktopRuntime {
     started: Instant,
     scheduled: AtomicBool,
     smoke_session: AtomicI8,
+    smoke_fail_creation: AtomicBool,
     last_resync: AtomicU64,
     log: Mutex<Option<mpsc::SyncSender<HealthEvent>>>,
 }
@@ -54,6 +55,7 @@ impl Default for DesktopRuntime {
             started: Instant::now(),
             scheduled: AtomicBool::new(false),
             smoke_session: AtomicI8::new(-1),
+            smoke_fail_creation: AtomicBool::new(false),
             last_resync: AtomicU64::new(0),
             log: Mutex::new(None),
         }
@@ -347,10 +349,28 @@ fn tick(app: &tauri::AppHandle) {
     finish_recreation(app);
     finish_mounted_windows(app);
     for label in LABELS {
+        let pending = runtime.windows.lock().unwrap().get(label).cloned();
         let Some(window) = app.get_webview_window(label) else {
+            // A failed controller creation leaves no HWND to probe. Still use
+            // the same grace period and two-attempt budget to retry creation;
+            // otherwise the first transient WebView2 error loses this window
+            // permanently despite a responsive tray host.
+            if let Some(snapshot) = pending {
+                let retry_creation = runtime
+                    .health
+                    .lock()
+                    .unwrap()
+                    .inspect(label, snapshot.visible, runtime.now())
+                    .is_some();
+                if retry_creation {
+                    if let Some(saved) = runtime.windows.lock().unwrap().get_mut(label) {
+                        saved.recreate = true;
+                    }
+                    runtime.record("missing-window-recreate", label);
+                }
+            }
             continue;
         };
-        let pending = runtime.windows.lock().unwrap().get(label).cloned();
         let visible = pending
             .as_ref()
             .map(|s| s.visible)
@@ -455,6 +475,17 @@ fn finish_recreation(app: &tauri::AppHandle) {
         let Some(config) = app.config().app.windows.iter().find(|c| c.label == label) else {
             continue;
         };
+        if label == "mascot"
+            && smoke_enabled()
+            && app
+                .state::<DesktopRuntime>()
+                .smoke_fail_creation
+                .swap(false, Ordering::SeqCst)
+        {
+            app.state::<DesktopRuntime>()
+                .record("smoke-window-create-failed", &label);
+            continue;
+        }
         match tauri::WebviewWindowBuilder::from_config(app, config).and_then(|builder| {
             let builder = if matches!(
                 std::env::var("HUALI_AI_VISUAL_SMOKE_FORCE_MOTION").as_deref(),
@@ -560,6 +591,9 @@ pub fn handle_smoke_command(app: &tauri::AppHandle, arguments: &[String]) -> boo
                     "localStorage.setItem('huali_ai_todo_input_draft','runtime-recovery-draft')",
                 );
             }
+        }
+        "fail-next-mascot-create" => {
+            runtime.smoke_fail_creation.store(true, Ordering::SeqCst);
         }
         "hang-mascot" => {
             if let Some(window) = app.get_webview_window("mascot") {

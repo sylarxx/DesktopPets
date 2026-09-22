@@ -176,6 +176,7 @@ impl RuntimeHealth {
         };
         view.repairs += 1;
         view.recovered = true;
+        view.application_ready = false;
         // A hidden notification can be prepared off-screen; only its normal
         // generation/layout handshake may show it again.
         view.restore_visible = visible;

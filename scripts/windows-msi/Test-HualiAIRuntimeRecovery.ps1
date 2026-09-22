@@ -93,7 +93,7 @@ foreach ($key in @('HUALI_AI_RELEASE_SMOKE', 'HUALI_AI_RELEASE_SMOKE_NONCE', 'HU
   $previousEnvironment[$key] = [Environment]::GetEnvironmentVariable($key, 'Process')
 }
 try {
-  foreach ($caseName in @('session-lock-unlock', 'renderer-hang', 'renderer-exit', 'browser-exit')) {
+  foreach ($caseName in @('session-lock-unlock', 'renderer-hang', 'renderer-exit', 'browser-exit', 'browser-exit-create-retry')) {
     $nonce = [Guid]::NewGuid().ToString('N')
     $script:receiptPath = Join-Path ([IO.Path]::GetTempPath()) "huali-runtime-smoke-$nonce.json"
     [Environment]::SetEnvironmentVariable('HUALI_AI_RELEASE_SMOKE', '1', 'Process')
@@ -125,6 +125,7 @@ try {
         }
         'renderer-hang' { Invoke-RuntimeCommand 'hang-mascot' }
         default {
+          if ($caseName -eq 'browser-exit-create-retry') { Invoke-RuntimeCommand 'fail-next-mascot-create' }
           $owned = @(Get-OwnedWebViewProcesses $script:runtimeProcess.Id)
           $targets = if ($caseName -eq 'renderer-exit') {
             @($owned | Where-Object { $_.CommandLine -match '--type=renderer\b' })
@@ -151,7 +152,8 @@ try {
         if ($after.$label.focused -and -not $before.$label.focused) { throw "Recovery stole focus: $label" }
       }
       if ($after.mascot.processId -ne $script:runtimeProcess.Id) { throw 'Recovery restarted the main process.' }
-      if ($caseName -eq 'browser-exit' -and $after.mascot.generation -le $before.mascot.generation) { throw 'Browser exit did not rebuild the native WebView.' }
+      if ($caseName -like 'browser-exit*' -and $after.mascot.generation -le $before.mascot.generation) { throw 'Browser exit did not rebuild the native WebView.' }
+      if ($caseName -eq 'browser-exit-create-retry' -and $after.mascot.repairs -ne 2) { throw 'Transient creation failure did not consume exactly one retry.' }
       # Deliver a real mouse event at the recovered mascot, then require a fresh JS receipt.
       $pointX = [int]($after.mascot.position.x + $after.mascot.size.width / 2)
       $pointY = [int]($after.mascot.position.y + $after.mascot.size.height / 2)
