@@ -56,3 +56,5 @@
 故障注入前先通过实际鼠标操作把焦点移到应用外；恢复后用 Windows `GetForegroundWindow` 所属进程再次确认未激活助手。此项与截图、DOM 回执分别检查，不能仅凭某一个 WebView 报告自己没有焦点判定通过。
 
 程序二进制和 MSI 均以该次通过的构建为准。之后的交付整理只补齐压缩包中的 `Test-HualiAIRuntimeRecovery.ps1` 并记录验收结果，不改动 MSI；本地交付目录保存重新核对后的 MSI 和 ZIP 校验值。
+
+最终还直接提取 MSI 的 CAB 主程序，确认其 SHA256 与实际安装、完成五项故障测试的主程序完全一致。`APPLICATION-SHA256.txt` 记录的是打包前文件；两者只有唯一的 `__TAURI_BUNDLE_TYPE_VAR_UNK` → `__TAURI_BUNDLE_TYPE_VAR_MSI` 类型标记差异，逆向还原后全文件哈希匹配，符合 [Tauri CLI 2.11.2 的打包与还原实现](https://github.com/tauri-apps/tauri/blob/tauri-cli-v2.11.2/crates/tauri-bundler/src/bundle.rs)。最终分发 ZIP 已通过压缩包完整性及逐文件一致性检查，校验值和部署命令见 `artifacts/delivery-v1.0.54/DELIVERY.md`。
