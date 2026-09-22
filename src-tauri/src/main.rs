@@ -5276,6 +5276,9 @@ fn main() {
         .manage(pending_desktop_auth)
         .plugin(tauri_plugin_single_instance::init(
             move |app, argv, _cwd| {
+                if runtime_recovery::handle_smoke_command(app, &argv) {
+                    return;
+                }
                 if let Some(callback_url) = single_instance_desktop_auth.capture(&argv) {
                     let mut fields = desktop_auth_callback_diagnostic_fields(&callback_url);
                     fields.extend(diagnostic_fields(serde_json::json!({
@@ -5341,6 +5344,8 @@ fn main() {
             runtime_recovery::desktop_runtime_ready,
             runtime_recovery::desktop_runtime_mounted,
             runtime_recovery::desktop_runtime_ack,
+            runtime_recovery::desktop_runtime_smoke_receipt,
+            runtime_recovery::request_runtime_resync,
             runtime_recovery::request_notification_recovery,
             hide_main_window,
             show_mascot_context_menu,

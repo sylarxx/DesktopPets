@@ -6,11 +6,13 @@ export interface RuntimeState {
   interactive: boolean
   recovered: boolean
   visible: boolean
+  deliveryGeneration?: number
 }
 export interface RuntimeProbe extends RuntimeState { sequence: number; paint: boolean }
 export const RUNTIME_RECOVERY_EVENT = 'desktop-runtime-state'
 const PROBE_EVENT = 'desktop-runtime-probe'
 const INSTANCE = `${Date.now()}-${Math.random().toString(36).slice(2)}`
+let applicationMounted = false
 
 export async function startRuntimeRecovery(onState: (state: RuntimeState) => void) {
   if (!isTauri()) return () => {}
@@ -24,7 +26,7 @@ export async function startRuntimeRecovery(onState: (state: RuntimeState) => voi
   }
   const probe = (event: Event) => {
     const payload = (event as CustomEvent<RuntimeProbe>).detail
-    if (!payload || disposed) return
+    if (!payload || disposed || payload.epoch < latestEpoch) return
     apply(payload)
     const ack = (painted: boolean) => {
       if (!disposed) void invoke('desktop_runtime_ack', {
@@ -38,6 +40,8 @@ export async function startRuntimeRecovery(onState: (state: RuntimeState) => voi
     })
   }
   window.addEventListener(PROBE_EVENT, probe)
+  const online = () => { void invoke('request_runtime_resync').catch(() => {}) }
+  window.addEventListener('online', online)
   let unlisten: (() => void) | undefined
   try {
     unlisten = await listen<RuntimeState>(RUNTIME_RECOVERY_EVENT, ({ payload }) => apply(payload))
@@ -50,7 +54,10 @@ export async function startRuntimeRecovery(onState: (state: RuntimeState) => voi
   // budgets on repeated probes; it only identifies this renderer lifetime.
   const attachOnProbe = () => {
     void invoke<RuntimeState>('desktop_runtime_ready', { instance: INSTANCE })
-      .then(apply).catch(() => {})
+      .then(state => {
+        apply(state)
+        if (!disposed && applicationMounted) markRuntimeMounted()
+      }).catch(() => {})
   }
   if (latestEpoch < 0) window.addEventListener(PROBE_EVENT, attachOnProbe, { once: true })
   return () => {
@@ -58,6 +65,7 @@ export async function startRuntimeRecovery(onState: (state: RuntimeState) => voi
     unlisten?.()
     if (frame !== undefined) cancelAnimationFrame(frame)
     window.removeEventListener(PROBE_EVENT, probe)
+    window.removeEventListener('online', online)
     window.removeEventListener(PROBE_EVENT, attachOnProbe)
   }
 }
@@ -67,5 +75,6 @@ export function requestNotificationRecovery() {
 }
 
 export function markRuntimeMounted() {
+  applicationMounted = true
   if (isTauri()) void invoke('desktop_runtime_mounted', { instance: INSTANCE }).catch(() => {})
 }

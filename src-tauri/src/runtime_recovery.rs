@@ -2,18 +2,20 @@ use crate::runtime_health::{Repair, RuntimeHealth, LABELS};
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicI8, AtomicU64, Ordering},
     mpsc, Mutex,
 };
 use std::time::Instant;
 use tauri::{Emitter, Manager, PhysicalPosition, PhysicalSize, Position, Size};
 
 #[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RuntimeState {
     epoch: u64,
     interactive: bool,
     recovered: bool,
     visible: bool,
+    delivery_generation: u64,
 }
 
 #[derive(Clone)]
@@ -39,6 +41,8 @@ pub struct DesktopRuntime {
     windows: Mutex<BTreeMap<String, RecoveryWindow>>,
     started: Instant,
     scheduled: AtomicBool,
+    smoke_session: AtomicI8,
+    last_resync: AtomicU64,
     log: Mutex<Option<mpsc::SyncSender<HealthEvent>>>,
 }
 
@@ -49,6 +53,8 @@ impl Default for DesktopRuntime {
             windows: Mutex::new(BTreeMap::new()),
             started: Instant::now(),
             scheduled: AtomicBool::new(false),
+            smoke_session: AtomicI8::new(-1),
+            last_resync: AtomicU64::new(0),
             log: Mutex::new(None),
         }
     }
@@ -62,7 +68,13 @@ impl DesktopRuntime {
         self.health.lock().map(|h| h.interactive).unwrap_or(false)
     }
 
-    fn state(&self, label: &str) -> RuntimeState {
+    fn state(&self, app: &tauri::AppHandle, label: &str) -> RuntimeState {
+        let delivery_generation = app
+            .state::<crate::MascotSystemNotificationState>()
+            .status
+            .lock()
+            .map(|s| s.client_generation)
+            .unwrap_or(0);
         let h = self.health.lock().unwrap();
         let view = &h.views[label];
         RuntimeState {
@@ -70,10 +82,11 @@ impl DesktopRuntime {
             interactive: h.interactive,
             recovered: view.recovered,
             visible: view.restore_visible,
+            delivery_generation,
         }
     }
 
-    fn record(&self, event: &'static str, label: &str) {
+    pub fn record(&self, event: &'static str, label: &str) {
         let epoch = self.health.lock().map(|h| h.epoch).unwrap_or(0);
         if let Ok(sender) = self.log.lock() {
             if let Some(sender) = sender.as_ref() {
@@ -142,6 +155,11 @@ pub fn initialize(app: &tauri::AppHandle) {
 
 pub fn session_changed(app: &tauri::AppHandle, interactive: bool, force: bool) {
     let runtime = app.state::<DesktopRuntime>();
+    let interactive = match runtime.smoke_session.load(Ordering::SeqCst) {
+        0 => false,
+        1 => true,
+        _ => interactive,
+    };
     let changed = runtime
         .health
         .lock()
@@ -162,7 +180,7 @@ pub fn session_changed(app: &tauri::AppHandle, interactive: bool, force: bool) {
 
 fn publish_state(app: &tauri::AppHandle) {
     for label in LABELS {
-        let state = app.state::<DesktopRuntime>().state(label);
+        let state = app.state::<DesktopRuntime>().state(app, label);
         let _ = app.emit_to(label, "desktop-runtime-state", state);
     }
 }
@@ -183,7 +201,7 @@ pub fn desktop_runtime_ready(
     {
         return Err("stale renderer".into());
     }
-    let state = runtime.state(window.label());
+    let state = runtime.state(app, window.label());
     if state.epoch != before {
         runtime.record("renderer-attached-after-repair", window.label());
         publish_state(app);
@@ -244,6 +262,25 @@ pub fn request_notification_recovery(window: tauri::WebviewWindow) {
             .lock()
             .unwrap()
             .request("mascot-notification", false);
+    }
+}
+
+#[tauri::command]
+pub fn request_runtime_resync(window: tauri::WebviewWindow) {
+    let app = window.app_handle();
+    let runtime = app.state::<DesktopRuntime>();
+    if window.label() != "mascot" || !runtime.interactive() {
+        return;
+    }
+    let now = runtime.now();
+    if runtime
+        .last_resync
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |last| {
+            (last == 0 || now.saturating_sub(last) >= 15_000).then_some(now.max(1))
+        })
+        .is_ok()
+    {
+        session_changed(app, true, true);
     }
 }
 
@@ -327,25 +364,17 @@ fn tick(app: &tauri::AppHandle) {
             repair_window(app, &window, repair);
             continue;
         }
-        let (state, sequence) = {
+        let state = runtime.state(app, label);
+        let sequence = {
             let mut h = runtime.health.lock().unwrap();
-            let epoch = h.epoch;
-            let interactive = h.interactive;
             let view = h.views.get_mut(label).unwrap();
             view.sequence += 1;
-            (
-                RuntimeState {
-                    epoch,
-                    interactive,
-                    recovered: view.recovered,
-                    visible: view.restore_visible,
-                },
-                view.sequence,
-            )
+            view.sequence
         };
         let payload = serde_json::json!({
             "epoch": state.epoch, "interactive": state.interactive,
             "recovered": state.recovered, "visible": state.visible,
+            "deliveryGeneration": state.delivery_generation,
             "sequence": sequence, "paint": visible && pending.is_none(),
         });
         let _ = window.eval(format!(
@@ -494,4 +523,124 @@ fn finish_mounted_windows(app: &tauri::AppHandle) {
     }
     runtime.health.lock().unwrap().epoch += 1;
     publish_state(app);
+}
+
+// Fault injection is inert in normal launches. It requires both existing release
+// smoke opt-ins and a fresh, isolated WebView profile supplied by the Windows QA
+// harness. Commands are a closed list; no caller-provided script is evaluated.
+fn smoke_enabled() -> bool {
+    crate::desktop_release_smoke_nonce().is_some()
+        && matches!(
+            std::env::var("HUALI_AI_VISUAL_SMOKE_FORCE_MOTION").as_deref(),
+            Ok("1")
+        )
+}
+
+pub fn handle_smoke_command(app: &tauri::AppHandle, arguments: &[String]) -> bool {
+    if !smoke_enabled() {
+        return false;
+    }
+    let Some(command) = arguments
+        .iter()
+        .find_map(|arg| arg.strip_prefix("--huali-runtime-smoke="))
+    else {
+        return false;
+    };
+    let runtime = app.state::<DesktopRuntime>();
+    match command {
+        "lock" | "unlock" => {
+            runtime
+                .smoke_session
+                .store(i8::from(command == "unlock"), Ordering::SeqCst);
+            session_changed(app, command == "unlock", false);
+        }
+        "seed" => {
+            if let Some(window) = app.get_webview_window("mascot") {
+                let _ = window.eval(
+                    "localStorage.setItem('huali_ai_todo_input_draft','runtime-recovery-draft')",
+                );
+            }
+        }
+        "hang-mascot" => {
+            if let Some(window) = app.get_webview_window("mascot") {
+                runtime.record("smoke-renderer-hang", "mascot");
+                let _ = window.eval("for (;;) {}");
+            }
+        }
+        command if command.starts_with("snapshot-") => {
+            let Ok(sequence) = command[9..].parse::<u64>() else {
+                return true;
+            };
+            for label in LABELS {
+                if let Some(window) = app.get_webview_window(label) {
+                    let _ = window.eval(format!(r#"
+                        if (!window.__runtimeSmokePointerInstalled) {{
+                            window.__runtimeSmokePointerInstalled = true;
+                            window.__runtimeSmokePointerCount = 0;
+                            document.addEventListener('pointerdown', () => window.__runtimeSmokePointerCount++, true);
+                        }}
+                        window.__TAURI_INTERNALS__.invoke('desktop_runtime_smoke_receipt', {{
+                            sequence: {sequence},
+                            draftPresent: localStorage.getItem('huali_ai_todo_input_draft') === 'runtime-recovery-draft',
+                            domPresent: !!document.querySelector('#app > *'),
+                            pointerCount: window.__runtimeSmokePointerCount,
+                        }}).catch(() => {{}});
+                    "#));
+                }
+            }
+        }
+        _ => {}
+    }
+    true
+}
+
+#[tauri::command]
+pub fn desktop_runtime_smoke_receipt(
+    window: tauri::WebviewWindow,
+    sequence: u64,
+    draft_present: bool,
+    dom_present: bool,
+    pointer_count: u64,
+) -> bool {
+    if !smoke_enabled() {
+        return false;
+    }
+    let Some(nonce) = crate::desktop_release_smoke_nonce() else {
+        return false;
+    };
+    // Window getters must precede locks: they may marshal to the UI thread.
+    let visible = window.is_visible().unwrap_or(false);
+    let position = window.outer_position().ok();
+    let size = window.outer_size().ok();
+    let runtime = window.state::<DesktopRuntime>();
+    let entry = {
+        let h = runtime.health.lock().unwrap();
+        let Some(view) = h.views.get(window.label()) else {
+            return false;
+        };
+        serde_json::json!({
+            "sequence": sequence, "draftPresent": draft_present,
+            "domPresent": dom_present, "pointerCount": pointer_count,
+            "processId": std::process::id(), "epoch": h.epoch,
+            "interactive": h.interactive, "repairs": view.repairs,
+            "generation": view.native_generation, "mounted": view.application_ready,
+            "recovered": view.recovered, "nativeVisible": visible,
+            "position": position, "size": size,
+        })
+    };
+    static RECEIPT_LOCK: Mutex<()> = Mutex::new(());
+    let Ok(_guard) = RECEIPT_LOCK.lock() else {
+        return false;
+    };
+    let path = std::env::temp_dir().join(format!("huali-runtime-smoke-{nonce}.json"));
+    let mut receipt = std::fs::read(&path)
+        .ok()
+        .and_then(|bytes| {
+            serde_json::from_slice::<BTreeMap<String, serde_json::Value>>(&bytes).ok()
+        })
+        .unwrap_or_default();
+    receipt.insert(window.label().into(), entry);
+    serde_json::to_vec(&receipt)
+        .ok()
+        .is_some_and(|bytes| std::fs::write(path, bytes).is_ok())
 }

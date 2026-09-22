@@ -290,6 +290,11 @@ function handleNotificationStopped(presentation: MascotSystemNotificationPresent
 }
 
 function recoverDesktopRuntime(state: RuntimeState) {
+  // Native state survives renderer reload and is authoritative even if the
+  // computer clock moved backwards while locked.
+  if (Number.isSafeInteger(state.deliveryGeneration)) {
+    systemNotificationSyncGeneration = Math.max(systemNotificationSyncGeneration, state.deliveryGeneration!)
+  }
   runtimeRecovered ||= state.recovered
   runtimeInteractive.value = state.interactive
   if (windowMode !== 'mascot') return
@@ -1218,6 +1223,9 @@ function queueDesktopReleaseSmokeReminders() {
 
 onMounted(async () => {
   removeRuntimeRecovery = await startRuntimeRecovery((state) => {
+    if (Number.isSafeInteger(state.deliveryGeneration)) {
+      systemNotificationSyncGeneration = Math.max(systemNotificationSyncGeneration, state.deliveryGeneration!)
+    }
     runtimeRecovered ||= state.recovered
     runtimeInteractive.value = state.interactive
     pendingRuntimeState = state

@@ -154,10 +154,25 @@ pub fn start(app: tauri::AppHandle) {
             (observer.as_mut() as *mut Observer).cast(),
         );
         if hwnd.is_null() {
+            observer
+                .app
+                .state::<crate::runtime_recovery::DesktopRuntime>()
+                .record("session-observer-create-failed", "");
             return;
         }
-        WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION);
-        SetTimer(hwnd, 1, 5_000, None);
+        if WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION) == 0 {
+            // The periodic WTS query still detects lock/unlock if registration fails.
+            observer
+                .app
+                .state::<crate::runtime_recovery::DesktopRuntime>()
+                .record("session-registration-failed", "");
+        }
+        if SetTimer(hwnd, 1, 5_000, None) == 0 {
+            observer
+                .app
+                .state::<crate::runtime_recovery::DesktopRuntime>()
+                .record("session-timer-failed", "");
+        }
         let mut message = std::mem::zeroed();
         while GetMessageW(&mut message, std::ptr::null_mut(), 0, 0) > 0 {
             TranslateMessage(&message);
@@ -179,18 +194,17 @@ pub fn install_process_handler(window: &tauri::WebviewWindow) {
         let handler = ProcessFailedEventHandler::create(Box::new(move |_, args| {
             if let Some(args) = args {
                 let mut kind = COREWEBVIEW2_PROCESS_FAILED_KIND(0);
-                if args.ProcessFailedKind(&mut kind).is_ok() {
-                    if kind == COREWEBVIEW2_PROCESS_FAILED_KIND_BROWSER_PROCESS_EXITED
+                if args.ProcessFailedKind(&mut kind).is_ok()
+                    && (kind == COREWEBVIEW2_PROCESS_FAILED_KIND_BROWSER_PROCESS_EXITED
                         || kind == COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_EXITED
-                        || kind == COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_UNRESPONSIVE
-                    {
-                        crate::runtime_recovery::process_failed(
-                            &app,
-                            &label,
-                            kind == COREWEBVIEW2_PROCESS_FAILED_KIND_BROWSER_PROCESS_EXITED,
-                            generation,
-                        );
-                    }
+                        || kind == COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_UNRESPONSIVE)
+                {
+                    crate::runtime_recovery::process_failed(
+                        &app,
+                        &label,
+                        kind == COREWEBVIEW2_PROCESS_FAILED_KIND_BROWSER_PROCESS_EXITED,
+                        generation,
+                    );
                 }
             }
             Ok(())

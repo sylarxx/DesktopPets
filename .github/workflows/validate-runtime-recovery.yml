@@ -31,7 +31,7 @@ jobs:
         run: >-
           npm test -- src/utils/notification-delivery.test.ts
           src/utils/recovery-storage.test.ts src/services/sys-message.service.test.ts
-          src/services/websocket.service.test.ts src/stores/task.test.ts
+          src/services/websocket.service.test.ts src/services/runtime-recovery.service.test.ts src/stores/task.test.ts
           src/utils/mascot-panel-access.test.ts
       - run: node scripts/qa/check-runtime-recovery.mjs
       - run: npm run build:intranet
@@ -50,6 +50,12 @@ jobs:
           $env:BUILD_MODE = 'intranet'
           npm run tauri -- build --no-bundle
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Native process failure and session recovery
+        shell: pwsh
+        run: |
+          & ./scripts/windows-msi/Test-HualiAIRuntimeRecovery.ps1 `
+            -ExecutablePath ./src-tauri/target/release/HualiAIDesktopAssistant.exe `
+            -OutputDirectory ./artifacts/runtime-recovery-qa/windows-runtime
       - name: Native window behavior
         shell: pwsh
         run: |

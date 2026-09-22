@@ -107,6 +107,26 @@ describe('websocketService connection generations', () => {
     vi.useRealTimers()
   })
 
+  it('replaces an apparently open overnight connection without accepting its late events', async () => {
+    service = (await import('./websocket.service')).websocketService
+    const listener = vi.fn()
+    const remove = service.onTask(listener)
+    service.connect()
+    const old = FakeWebSocket.instances[0]
+    old.open()
+    service.connect({ force: true })
+    const fresh = FakeWebSocket.instances[1]
+    fresh.open()
+    old.message(taskEvent('stale'))
+    old.serverClose()
+    fresh.message(taskEvent('fresh'))
+    await vi.advanceTimersByTimeAsync(4000)
+    expect(old.closeCalls).toBe(1)
+    expect(FakeWebSocket.instances).toHaveLength(2)
+    expect(listener).toHaveBeenCalledExactlyOnceWith(taskEvent('fresh'))
+    remove()
+  })
+
   it('ignores message, close and error callbacks from a disconnected socket after a new connect', async () => {
     service = (await import('./websocket.service')).websocketService
     const taskListener = vi.fn()
