@@ -1,5 +1,12 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+#[cfg_attr(not(windows), allow(dead_code))]
+mod runtime_health;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod runtime_recovery;
+#[cfg(windows)]
+mod windows_session;
+
 use std::collections::VecDeque;
 use std::fs;
 #[cfg(windows)]
@@ -1075,6 +1082,12 @@ fn hide_transparent_window_safely(window: &tauri::WebviewWindow) -> bool {
 }
 
 fn show_interactive_window(window: &tauri::WebviewWindow, activate: bool) -> bool {
+    if !window
+        .state::<runtime_recovery::DesktopRuntime>()
+        .interactive()
+    {
+        return false;
+    }
     if window.set_ignore_cursor_events(false).is_err() {
         let _ = hide_transparent_window_safely(window);
         return false;
@@ -4343,6 +4356,7 @@ fn hide_main_window(
     app: tauri::AppHandle,
     hover_monitor: tauri::State<'_, MascotPeekHoverMonitor>,
 ) -> bool {
+    app.state::<runtime_recovery::DesktopRuntime>().user_hide();
     hover_monitor.cancel();
     // A user-selected hide is different from dismissing the context menu by
     // clicking elsewhere. Publish that intent in the same visibility event so
@@ -5088,6 +5102,130 @@ async fn open_or_focus_web_url(url: String, match_url: String) -> bool {
         .unwrap_or(false)
 }
 
+#[cfg_attr(not(windows), allow(dead_code))]
+fn reset_window_for_runtime_recovery(app: &tauri::AppHandle, label: &str) {
+    if label == "mascot" {
+        app.state::<MascotPeekHoverMonitor>().cancel();
+        app.state::<MascotDockMotion>().cancel();
+        hide_mascot_context_menu_window(app);
+        hide_mascot_system_notification_native_window(app);
+    } else if label == "mascot-notification" {
+        let state = app.state::<MascotSystemNotificationState>();
+        if let Ok(mut status) = state.status.lock() {
+            let generation = status.generation.wrapping_add(1);
+            let client_generation = status.client_generation;
+            *status = MascotSystemNotificationStatus {
+                generation,
+                client_generation,
+                ..Default::default()
+            };
+        };
+    } else if label == "mascot-menu" {
+        let state = app.state::<MascotContextMenuState>();
+        if let Ok(mut status) = state.status.lock() {
+            let generation = status.generation.wrapping_add(1);
+            *status = MascotContextMenuStatus {
+                generation,
+                ..Default::default()
+            };
+        };
+        let _ = emit_mascot_context_menu_visibility(app, false, true);
+    }
+}
+
+fn configure_desktop_window(
+    app: &tauri::AppHandle,
+    window: &tauri::WebviewWindow,
+) -> tauri::Result<()> {
+    if window.label() == "mascot" {
+        harden_transparent_window(window);
+        window.set_ignore_cursor_events(true)?;
+        let _ = place_mascot_bottom_right(window);
+        let close_window = window.clone();
+        let close_app = app.clone();
+        window.on_window_event(move |event| match event {
+            tauri::WindowEvent::CloseRequested { api, .. } => {
+                api.prevent_close();
+                close_app.state::<MascotPeekHoverMonitor>().cancel();
+                hide_mascot_context_menu_window_with_restore(&close_app, false);
+                hide_mascot_system_notification_native_window(&close_app);
+                let _ = hide_transparent_window_safely(&close_window);
+                hide_panel_and_notify(&close_app);
+            }
+            tauri::WindowEvent::Moved(_) => {
+                // Windows native dragging has one compositor-paced
+                // monitor above. Other platforms use their move event.
+                #[cfg(not(windows))]
+                sync_visible_mascot_system_notification_to_mascot(&close_app);
+            }
+            _ => {}
+        });
+    }
+    if window.label() == "panel" {
+        harden_transparent_window(window);
+        window.set_ignore_cursor_events(true)?;
+        let close_app = app.clone();
+        let app_handle = app.clone();
+        window.on_window_event(move |event| match event {
+            tauri::WindowEvent::CloseRequested { api, .. } => {
+                api.prevent_close();
+                hide_panel_and_notify(&close_app);
+            }
+            tauri::WindowEvent::Focused(false) => {
+                hide_panel_after_focus_moves_outside_app(app_handle.clone());
+            }
+            _ => {}
+        });
+    }
+    if window.label() == "mascot-menu" {
+        harden_transparent_window(window);
+        let close_app = app.clone();
+        let app_handle = app.clone();
+        window.on_window_event(move |event| match event {
+            tauri::WindowEvent::CloseRequested { api, .. } => {
+                api.prevent_close();
+                hide_mascot_context_menu_window(&close_app);
+            }
+            tauri::WindowEvent::Focused(false) => {
+                hide_context_menu_after_focus_moves_outside_app(app_handle.clone());
+            }
+            _ => {}
+        });
+        #[cfg(windows)]
+        {
+            // A WebView2 hosted by a never-visible HWND may postpone
+            // navigation indefinitely. Warm it up fully transparent,
+            // click-through and off-screen; its ready IPC immediately
+            // hides it before any user interaction can occur.
+            window.set_ignore_cursor_events(true)?;
+            window.set_position(Position::Physical(PhysicalPosition::new(-32_000, -32_000)))?;
+            show_window_without_activation(window).map_err(std::io::Error::other)?;
+        }
+    }
+    if window.label() == "mascot-notification" {
+        harden_transparent_window(window);
+        let close_app = app.clone();
+        window.on_window_event(move |event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                hide_mascot_system_notification_native_window(&close_app);
+            }
+        });
+        #[cfg(windows)]
+        {
+            // Keep this renderer active before the first system message,
+            // but never expose its warm-up surface on the desktop.
+            window.set_ignore_cursor_events(true)?;
+            window.set_position(Position::Physical(PhysicalPosition::new(-32_000, -32_000)))?;
+            show_window_without_activation(window).map_err(std::io::Error::other)?;
+        }
+    }
+
+    #[cfg(windows)]
+    windows_session::install_process_handler(window);
+    Ok(())
+}
+
 fn main() {
     let startup_args = std::env::args().collect::<Vec<_>>();
     if let Some(callback_url) = find_desktop_auth_callback(&startup_args) {
@@ -5189,6 +5327,7 @@ fn main() {
         .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_http::init())
         .plugin(tauri_plugin_opener::init())
+        .manage(runtime_recovery::DesktopRuntime::default())
         .manage(InitialMascotPlacement::default())
         .manage(MascotDockMotion::default())
         .manage(MascotSystemNotificationState::default())
@@ -5199,6 +5338,10 @@ fn main() {
         .manage(PanelActivityState::default())
         .manage(PanelLayoutState::default())
         .invoke_handler(tauri::generate_handler![
+            runtime_recovery::desktop_runtime_ready,
+            runtime_recovery::desktop_runtime_mounted,
+            runtime_recovery::desktop_runtime_ack,
+            runtime_recovery::request_notification_recovery,
             hide_main_window,
             show_mascot_context_menu,
             ack_mascot_context_menu_layout,
@@ -5272,93 +5415,12 @@ fn main() {
                 }
             }
 
-            if let Some(window) = app.get_webview_window("mascot") {
-                harden_transparent_window(&window);
-                window.set_ignore_cursor_events(true)?;
-                let _ = place_mascot_bottom_right(&window);
-                let close_window = window.clone();
-                let close_app = app.handle().clone();
-                window.on_window_event(move |event| match event {
-                    tauri::WindowEvent::CloseRequested { api, .. } => {
-                        api.prevent_close();
-                        close_app.state::<MascotPeekHoverMonitor>().cancel();
-                        hide_mascot_context_menu_window_with_restore(&close_app, false);
-                        hide_mascot_system_notification_native_window(&close_app);
-                        let _ = hide_transparent_window_safely(&close_window);
-                        hide_panel_and_notify(&close_app);
-                    }
-                    tauri::WindowEvent::Moved(_) => {
-                        // Windows native dragging has one compositor-paced
-                        // monitor above. Other platforms use their move event.
-                        #[cfg(not(windows))]
-                        sync_visible_mascot_system_notification_to_mascot(&close_app);
-                    }
-                    _ => {}
-                });
-            }
-            if let Some(window) = app.get_webview_window("panel") {
-                harden_transparent_window(&window);
-                window.set_ignore_cursor_events(true)?;
-                let close_app = app.handle().clone();
-                let app_handle = app.handle().clone();
-                window.on_window_event(move |event| match event {
-                    tauri::WindowEvent::CloseRequested { api, .. } => {
-                        api.prevent_close();
-                        hide_panel_and_notify(&close_app);
-                    }
-                    tauri::WindowEvent::Focused(false) => {
-                        hide_panel_after_focus_moves_outside_app(app_handle.clone());
-                    }
-                    _ => {}
-                });
-            }
-            if let Some(window) = app.get_webview_window("mascot-menu") {
-                harden_transparent_window(&window);
-                let close_app = app.handle().clone();
-                let app_handle = app.handle().clone();
-                window.on_window_event(move |event| match event {
-                    tauri::WindowEvent::CloseRequested { api, .. } => {
-                        api.prevent_close();
-                        hide_mascot_context_menu_window(&close_app);
-                    }
-                    tauri::WindowEvent::Focused(false) => {
-                        hide_context_menu_after_focus_moves_outside_app(app_handle.clone());
-                    }
-                    _ => {}
-                });
-                #[cfg(windows)]
-                {
-                    // A WebView2 hosted by a never-visible HWND may postpone
-                    // navigation indefinitely. Warm it up fully transparent,
-                    // click-through and off-screen; its ready IPC immediately
-                    // hides it before any user interaction can occur.
-                    window.set_ignore_cursor_events(true)?;
-                    window.set_position(Position::Physical(PhysicalPosition::new(
-                        -32_000, -32_000,
-                    )))?;
-                    show_window_without_activation(&window).map_err(std::io::Error::other)?;
+            for label in runtime_health::LABELS {
+                if let Some(window) = app.get_webview_window(label) {
+                    configure_desktop_window(app.handle(), &window)?;
                 }
             }
-            if let Some(window) = app.get_webview_window("mascot-notification") {
-                harden_transparent_window(&window);
-                let close_app = app.handle().clone();
-                window.on_window_event(move |event| {
-                    if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                        api.prevent_close();
-                        hide_mascot_system_notification_native_window(&close_app);
-                    }
-                });
-                #[cfg(windows)]
-                {
-                    // Keep this renderer active before the first system message,
-                    // but never expose its warm-up surface on the desktop.
-                    window.set_ignore_cursor_events(true)?;
-                    window.set_position(Position::Physical(PhysicalPosition::new(
-                        -32_000, -32_000,
-                    )))?;
-                    show_window_without_activation(&window).map_err(std::io::Error::other)?;
-                }
-            }
+            runtime_recovery::initialize(app.handle());
 
             let open = MenuItem::with_id(app, "open_workbench", "打开工作台", true, None::<&str>)?;
             let show = MenuItem::with_id(app, "show", "显示助手", true, None::<&str>)?;
@@ -5397,6 +5459,7 @@ fn main() {
                         }
                     }
                     "hide" => {
+                        app.state::<runtime_recovery::DesktopRuntime>().user_hide();
                         hide_mascot_context_menu_window_with_restore(app, false);
                         app.state::<MascotPeekHoverMonitor>().cancel();
                         hide_mascot_system_notification_native_window(app);
@@ -5419,6 +5482,18 @@ fn main() {
 
             Ok(())
         })
-        .run(context)
-        .expect("error while running huali ai mascot");
+        .build(context)
+        .expect("error while building huali ai mascot")
+        .run(|app, event| {
+            // Recreating the last WebView must not exit the tray host. An
+            // explicit user quit (Some(0)) still exits immediately.
+            if let tauri::RunEvent::ExitRequested {
+                code: None, api, ..
+            } = event
+            {
+                if app.state::<runtime_recovery::DesktopRuntime>().rebuilding() {
+                    api.prevent_exit();
+                }
+            }
+        });
 }

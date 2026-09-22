@@ -383,7 +383,7 @@ function togglePanel() {
     emit('login')
     return
   }
-  if (!canOpenMascotTodoPanel(false, Boolean(props.sysMessage))) return
+  if (!canOpenMascotTodoPanel(false, props.systemMessageVisible)) return
   if (panelVisible.value && panelHasText.value) return
 
   dismissTransientOverlays()

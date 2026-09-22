@@ -10,15 +10,18 @@ interface NotificationDeliveryOptions<T> {
   show: (generation: number, presentation: T) => Promise<boolean>
   hide: (generation: number) => Promise<boolean>
   onVisible: (presentation: T | null) => void
-  onStopped?: () => void
+  onStopped?: (presentation: T) => void
 }
 
 // A message's recovery budget survives duplicate events, content updates and
-// temporary hides. Only an explicit session reset discards terminal failures.
+// temporary hides. Only a distinct recovery event or session reset opens a new
+// bounded round. Duplicate ready events must not create unlimited retries.
 export function createNotificationDelivery<T>(options: NotificationDeliveryOptions<T>) {
   const budgets = new Map<string, { attempts: number; deadline: number; stopped: boolean; complete: boolean }>()
   let intent = 0
   let disposed = false
+  let suspended = false
+  const recoveryEvents = new Set<string>()
   let latest: T | null = null
   let activeKey = ''
   let fingerprint = ''
@@ -61,7 +64,7 @@ export function createNotificationDelivery<T>(options: NotificationDeliveryOptio
     options.onVisible(null)
     // Invalidate a native show still in flight; hiding never needs renderer ACK.
     void options.hide(options.nextGeneration()).catch(() => {})
-    if (!alreadyStopped) options.onStopped?.()
+    if (!alreadyStopped && latest !== null) options.onStopped?.(latest)
   }
   async function attempt(token: number) {
     if (!isCurrent(token) || latest === null) return
@@ -100,10 +103,11 @@ export function createNotificationDelivery<T>(options: NotificationDeliveryOptio
     const generation = options.nextGeneration()
     void options.publish({ generation, presentation: latest }).catch(() => stop(token))
   }
-  return {
+  const api = {
     acknowledge,
     sync(presentation: T | null) {
       if (disposed) return
+      if (suspended) { latest = presentation; return }
       const nextKey = presentation === null ? '' : options.key(presentation)
       const nextFingerprint = JSON.stringify(presentation)
       if (nextKey === activeKey && nextFingerprint === fingerprint) return
@@ -127,6 +131,7 @@ export function createNotificationDelivery<T>(options: NotificationDeliveryOptio
       }
       let budget = budgets.get(nextKey)
       if (!budget) {
+        if (budgets.size >= 256) budgets.delete(budgets.keys().next().value!)
         budget = { attempts: 0, deadline: Date.now() + 10_000, stopped: false, complete: false }
         budgets.set(nextKey, budget)
       }
@@ -139,6 +144,28 @@ export function createNotificationDelivery<T>(options: NotificationDeliveryOptio
       deadlineTimer = setTimeout(() => stop(token), Math.max(0, budget.deadline - Date.now()))
       void attempt(token)
     },
+    suspend() {
+      if (disposed || suspended) return
+      suspended = true
+      cancel()
+      activeKey = fingerprint = ''
+      visible = false
+      options.onVisible(null)
+      void options.hide(options.nextGeneration()).catch(() => {})
+    },
+    recover(eventId: string, presentation: T | null) {
+      if (disposed || !eventId || recoveryEvents.has(eventId)) return false
+      recoveryEvents.add(eventId)
+      if (recoveryEvents.size > 64) recoveryEvents.delete(recoveryEvents.values().next().value!)
+      cancel()
+      budgets.clear()
+      suspended = false
+      activeKey = fingerprint = ''
+      visible = false
+      options.onVisible(null)
+      api.sync(presentation)
+      return true
+    },
     reset() {
       cancel()
       budgets.clear()
@@ -148,6 +175,7 @@ export function createNotificationDelivery<T>(options: NotificationDeliveryOptio
       options.onVisible(null)
       void options.hide(options.nextGeneration()).catch(() => {})
     },
-    dispose() { cancel(); disposed = true; budgets.clear() },
+    dispose() { cancel(); disposed = true; budgets.clear(); recoveryEvents.clear() },
   }
+  return api
 }

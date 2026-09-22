@@ -377,7 +377,7 @@ export const sysMessageService = {
     messageListeners.add(listener)
     return () => messageListeners.delete(listener)
   },
-  connect(userId: string, options: { force?: boolean } = {}) {
+  connect(userId: string, options: { force?: boolean; catchUp?: boolean } = {}) {
     if (env.enableMock) {
       recordDesktopDiagnostic('reminder.subscription.skipped', { reason: 'mock-mode' })
       return
@@ -398,6 +398,7 @@ export const sysMessageService = {
       force: Boolean(options.force),
       websocketEndpointConfigured: Boolean(env.sysMessageWsBaseUrl.trim()),
     })
+    if (options.catchUp) pollInitialized = false
     startPolling(userChanged)
 
     if (

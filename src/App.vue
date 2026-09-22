@@ -25,6 +25,8 @@ import { validateDesktopSession } from './services/session.service'
 import { getSysMessageFallback, resolveSysMessageContent } from './services/sys-message-content.service'
 import { sysMessageService } from './services/sys-message.service'
 import { websocketService } from './services/websocket.service'
+import { startRuntimeRecovery, markRuntimeMounted, requestNotificationRecovery, type RuntimeState } from './services/runtime-recovery.service'
+import { readRecoverySnapshot, writeRecoverySnapshot, clearRecoverySnapshots } from './utils/recovery-storage'
 import {
   PANEL_TASK_DELIVERED_EVENT,
   PANEL_TASK_READY_EVENT,
@@ -74,11 +76,29 @@ type ResolvedSysMessage = SysMessageNotification & {
   expiresAt: number
 }
 
+interface MascotRecoverySnapshot {
+  current: ResolvedSysMessage | null
+  queue: ResolvedSysMessage[]
+  deferred: ResolvedSysMessage[]
+  tasks: TaskCreatedEvent[]
+  sessionEpoch: number
+  hiddenKey: string
+}
+interface PanelRecoverySnapshot {
+  tasks: typeof taskStore.taskQueue
+  receivedEventIds: string[]
+  sessionEpoch: number | null
+}
+
 const taskStore = useTaskStore()
 const mascotStore = useMascotStore()
 const userStore = useUserStore()
 const searchParams = new URLSearchParams(window.location.search)
 const windowMode = searchParams.get('window') || 'mascot'
+const savedMascot = windowMode === 'mascot'
+  ? readRecoverySnapshot<MascotRecoverySnapshot>('mascot', userStore.userInfo?.userId || '') : null
+const savedPanel = windowMode === 'panel'
+  ? readRecoverySnapshot<PanelRecoverySnapshot>('panel', userStore.userInfo?.userId || '') : null
 const isSysMessagePreview = import.meta.env.DEV && searchParams.get('preview') === 'sys-message'
 const isTaskPreview = import.meta.env.DEV && windowMode === 'panel' && searchParams.get('preview') === 'task'
 const isMascotAnimationPreview = import.meta.env.DEV && searchParams.has('previewAnimation')
@@ -89,8 +109,16 @@ const hasTaskPreviewQueue = isTaskPreview && searchParams.get('previewQueue') ==
 const hasTaskPreviewError = isTaskPreview && searchParams.get('previewError') === '1'
 const hasTaskPreviewLongContent = isTaskPreview && searchParams.get('previewLong') === '1'
 const socketStatus = ref(env.enableMock ? 'mock' : 'closed')
-const currentSysMessage = ref<ResolvedSysMessage | null>(null)
-const sysMessageQueue = ref<ResolvedSysMessage[]>([])
+const currentSysMessage = ref<ResolvedSysMessage | null>(
+  savedMascot?.current && !isSysMessageExpired(savedMascot.current.expiresAt) ? savedMascot.current : null,
+)
+const sysMessageQueue = ref<ResolvedSysMessage[]>(Array.isArray(savedMascot?.queue) ? savedMascot.queue.filter(m => !isSysMessageExpired(m.expiresAt)) : [])
+const deferredSysMessages = ref<ResolvedSysMessage[]>(Array.isArray(savedMascot?.deferred) ? savedMascot.deferred.filter(m => !isSysMessageExpired(m.expiresAt)) : [])
+const runtimeInteractive = ref(true)
+let removeRuntimeRecovery: (() => void) | undefined
+let runtimeRecovered = false
+let runtimeCoordinatorReady = false
+let pendingRuntimeState: RuntimeState | undefined
 const sysMessageReadPendingKey = ref('')
 const sysMessageReadAllPending = ref(false)
 const sysMessageActionError = ref('')
@@ -134,7 +162,7 @@ let systemNotificationMessageKey = ''
 // Right-click “隐藏” suppresses only the presentation the user has already
 // seen. A later auth cycle or a newly delivered reminder receives a new key and
 // may wake the assistant, preserving the product promise on the menu action.
-let userHiddenSystemNotificationKey = ''
+let userHiddenSystemNotificationKey = savedMascot?.hiddenKey || ''
 const systemNotificationWindowReady = ref(false)
 const contextMenuWindowVisible = ref(false)
 const visibleSystemNotification = ref<MascotSystemNotificationPresentation | null>(null)
@@ -163,15 +191,15 @@ const notificationDelivery = createNotificationDelivery<MascotSystemNotification
   },
   hide: (generation) => hideMascotSystemNotificationWindow(generation),
   key: (presentation) => presentation.kind === 'auth' ? 'auth' : presentation.message.dedupeKey,
-  onStopped: () => mascotStore.showMessage('提醒暂未显示，消息已保留，可在工作台查看', 'idle', true),
+  onStopped: handleNotificationStopped,
   onVisible: (presentation) => { visibleSystemNotification.value = presentation },
 })
 let isDeliveringDeferredTasks = false
 const panelTaskStateReady = ref(false)
-const deferredTaskEvents: TaskCreatedEvent[] = []
+const deferredTaskEvents: TaskCreatedEvent[] = Array.isArray(savedMascot?.tasks) ? savedMascot.tasks : []
 const panelHasTask = ref(false)
-const panelSessionEpoch = ref<number | null>(null)
-let taskSessionEpoch = Date.now()
+const panelSessionEpoch = ref<number | null>(savedPanel?.sessionEpoch ?? null)
+let taskSessionEpoch = Number.isSafeInteger(savedMascot?.sessionEpoch) ? savedMascot!.sessionEpoch : Date.now()
 let mascotInteractionReadyResolved = false
 let resolveMascotInteractionReady: (() => void) | undefined
 const mascotInteractionReady = new Promise<void>((resolve) => {
@@ -217,6 +245,74 @@ const isCurrentSysMessageReadPending = computed(
 )
 const pendingSysMessageCount = computed(() => sysMessageQueue.value.length)
 
+if (savedPanel && Array.isArray(savedPanel.tasks)) {
+  taskStore.taskQueue = savedPanel.tasks.map(task => ({
+    ...task, handling: false,
+    error: task.handling ? '上次操作结果尚未确认，请先查看工作台' : task.error,
+  }))
+  taskStore.currentTask = taskStore.taskQueue[0] ?? null
+  taskStore.receivedEventIds = Array.isArray(savedPanel.receivedEventIds) ? savedPanel.receivedEventIds : []
+}
+
+function persistRecoveryState() {
+  const userId = storage.getUserInfo()?.userId || ''
+  if (windowMode === 'mascot') {
+    writeRecoverySnapshot('mascot', userId, {
+      current: currentSysMessage.value, queue: sysMessageQueue.value,
+      deferred: deferredSysMessages.value, tasks: deferredTaskEvents,
+      sessionEpoch: taskSessionEpoch, hiddenKey: userHiddenSystemNotificationKey,
+    } satisfies MascotRecoverySnapshot)
+  } else if (windowMode === 'panel') {
+    writeRecoverySnapshot('panel', userId, {
+      tasks: taskStore.taskQueue, receivedEventIds: taskStore.receivedEventIds,
+      sessionEpoch: panelSessionEpoch.value,
+    } satisfies PanelRecoverySnapshot)
+  }
+}
+
+watch([currentSysMessage, sysMessageQueue, deferredSysMessages, () => taskStore.taskQueue, panelSessionEpoch],
+  persistRecoveryState, { deep: true, flush: 'sync' })
+
+function handleNotificationStopped(presentation: MascotSystemNotificationPresentation) {
+  if (presentation.kind === 'message' && currentSysMessage.value?.dedupeKey === presentation.message.dedupeKey) {
+    const message = currentSysMessage.value
+    if (!deferredSysMessages.value.some(item => item.dedupeKey === message.dedupeKey)) {
+      deferredSysMessages.value.push(message)
+    }
+    // Keep unread data, but release the invisible head so clicks and later
+    // messages can proceed. Only a new runtime recovery round retries it.
+    showNextSysMessage()
+  }
+  if (runtimeInteractive.value) {
+    mascotStore.showMessage('提醒暂未显示，消息已保留，可在工作台查看', 'idle', true)
+    requestNotificationRecovery()
+  }
+}
+
+function recoverDesktopRuntime(state: RuntimeState) {
+  runtimeRecovered ||= state.recovered
+  runtimeInteractive.value = state.interactive
+  if (windowMode !== 'mascot') return
+  if (!state.interactive) {
+    notificationDelivery.suspend()
+    return
+  }
+  expireStaleSysMessages()
+  const messages = [currentSysMessage.value, ...sysMessageQueue.value, ...deferredSysMessages.value]
+    .filter((message): message is ResolvedSysMessage => Boolean(message && !isSysMessageExpired(message.expiresAt)))
+  const unique = [...new Map(messages.map(message => [message.dedupeKey, message])).values()]
+  currentSysMessage.value = unique.shift() ?? null
+  sysMessageQueue.value = unique
+  deferredSysMessages.value = []
+  contextMenuWindowVisible.value = false
+  const presentation = buildSystemNotificationPresentation()
+  notificationDelivery.recover(`native:${state.epoch}`, systemNotificationMessageKey === userHiddenSystemNotificationKey ? null : presentation)
+  connectDesktopSockets({ force: true, catchUp: true })
+  requestPanelTaskState()
+  scheduleSysMessageExpiry()
+  persistRecoveryState()
+}
+
 function publishPanelTaskState(requestReveal = false) {
   if (windowMode !== 'panel' || panelSessionEpoch.value === null) return
 
@@ -258,6 +354,7 @@ async function showTaskPanelWithFallback() {
 function queueTaskForPanel(event: TaskCreatedEvent) {
   if (deferredTaskEvents.some((item) => item.eventId === event.eventId)) return
   deferredTaskEvents.push(event)
+  persistRecoveryState()
 }
 
 async function deliverTasksWhenSystemMessagesFinish() {
@@ -331,6 +428,7 @@ function handleTaskDelivered(payload: PanelTaskDeliveredPayload) {
   taskDeliveryRetryTimer = undefined
   awaitingTaskDelivery = null
   deferredTaskEvents.shift()
+  persistRecoveryState()
   taskDeliveryFailureEventId = ''
   void deliverTasksWhenSystemMessagesFinish()
 }
@@ -495,6 +593,7 @@ function showIncomingSysMessage(message: ResolvedSysMessage) {
 }
 
 function expireStaleSysMessages(now = Date.now()) {
+  deferredSysMessages.value = deferredSysMessages.value.filter(message => !isSysMessageExpired(message.expiresAt, now))
   const activeQueue = sysMessageQueue.value.filter(
     (message) => !isSysMessageExpired(message.expiresAt, now),
   )
@@ -514,6 +613,7 @@ function scheduleSysMessageExpiry() {
   const expiries = [
     ...(currentSysMessage.value ? [currentSysMessage.value.expiresAt] : []),
     ...sysMessageQueue.value.map((message) => message.expiresAt),
+    ...deferredSysMessages.value.map((message) => message.expiresAt),
   ]
   if (!expiries.length) return
 
@@ -553,6 +653,8 @@ async function enrichSysMessage(message: SysMessageNotification, generation: num
 }
 
 function pushSysMessage(message: SysMessageNotification) {
+  if ([currentSysMessage.value, ...sysMessageQueue.value, ...deferredSysMessages.value]
+    .some(item => item?.dedupeKey === message.dedupeKey)) return
   if (recentSysMessageKeys.has(message.dedupeKey)) {
     recordDesktopDiagnostic('notification.renderer_duplicate', {
       messageIdMasked: maskDiagnosticIdentifier(message.id),
@@ -755,6 +857,7 @@ function buildSystemNotificationPresentation(): MascotSystemNotificationPresenta
 
 async function syncSystemNotificationWindow() {
   if (windowMode !== 'mascot') return
+  if (!runtimeInteractive.value) { notificationDelivery.suspend(); return }
   const presentation = buildSystemNotificationPresentation()
   if (!presentation) systemNotificationMessageKey = ''
   if (!presentation) userHiddenSystemNotificationKey = ''
@@ -814,12 +917,13 @@ watch(
   () => [
     currentSysMessage.value?.expiresAt ?? 0,
     ...sysMessageQueue.value.map((message) => message.expiresAt),
+    ...deferredSysMessages.value.map((message) => message.expiresAt),
   ],
   scheduleSysMessageExpiry,
   { immediate: true, flush: 'sync' },
 )
 
-function connectDesktopSockets(options: { force?: boolean } = {}) {
+function connectDesktopSockets(options: { force?: boolean; catchUp?: boolean } = {}) {
   if (needsAuth.value) {
     recordDesktopDiagnostic('subscription.start_blocked', {
       reason: 'desktop-session-missing',
@@ -840,7 +944,7 @@ function connectDesktopSockets(options: { force?: boolean } = {}) {
   // the legacy task socket must never suppress the sys_message polling/socket
   // channel that carries todo, meeting and message reminders.
   try {
-    websocketService.connect()
+    websocketService.connect(options)
   } catch (error) {
     recordDesktopDiagnostic('task.websocket.connect_unhandled', {
       errorName: error instanceof Error ? error.name : 'unknown',
@@ -887,6 +991,7 @@ function clearDesktopSession(message: string, status: MascotStatus = 'remind') {
   sysMessageExpiryTimer = undefined
   currentSysMessage.value = null
   sysMessageQueue.value = []
+  deferredSysMessages.value = []
   sysMessageReadPendingKey.value = ''
   sysMessageReadAllPending.value = false
   sysMessageActionError.value = ''
@@ -905,6 +1010,7 @@ function clearDesktopSession(message: string, status: MascotStatus = 'remind') {
   requestPanelTaskState()
   socketStatus.value = env.enableMock ? 'mock' : 'closed'
   stopSessionValidation()
+  clearRecoverySnapshots()
   mascotStore.showMessage(message, status, true)
 }
 
@@ -1111,6 +1217,13 @@ function queueDesktopReleaseSmokeReminders() {
 }
 
 onMounted(async () => {
+  removeRuntimeRecovery = await startRuntimeRecovery((state) => {
+    runtimeRecovered ||= state.recovered
+    runtimeInteractive.value = state.interactive
+    pendingRuntimeState = state
+    if (runtimeCoordinatorReady) recoverDesktopRuntime(state)
+    else if (!state.interactive) notificationDelivery.suspend()
+  })
   if (windowMode === 'mascot') {
     releaseSmokePrepared = await prepareDesktopReleaseSmokeState()
     recordDesktopDiagnostic('renderer.mascot_mounted', {
@@ -1158,6 +1271,7 @@ onMounted(async () => {
         }
         if (!visible && !restoreNotification) {
           userHiddenSystemNotificationKey = systemNotificationMessageKey
+          persistRecoveryState()
           notificationDelivery.sync(null)
           recordDesktopDiagnostic('interaction.context_menu.hide_intent', {
             presentationKind: systemNotificationMessageKey === 'auth'
@@ -1279,7 +1393,9 @@ onMounted(async () => {
     // transparent pixels cannot become a desktop-wide click interceptor.
     await setMascotNotificationVisible(false, false)
     await waitForMascotInteractionReady()
-    await showAssistant()
+    // A native repair may reload a deliberately hidden mascot. Restore the
+    // recorded visibility rather than turning that reload into a user show.
+    if (runtimeInteractive.value && !runtimeRecovered) await showAssistant()
   }
 
   if (windowMode === 'panel') {
@@ -1339,9 +1455,13 @@ onMounted(async () => {
       removeTrayLogoutListener = undefined
     }
   }
+  runtimeCoordinatorReady = true
+  if (pendingRuntimeState) recoverDesktopRuntime(pendingRuntimeState)
+  markRuntimeMounted()
 })
 
 onUnmounted(() => {
+  removeRuntimeRecovery?.()
   removeTaskListener?.()
   removeStatusListener?.()
   removeTrayListener?.()

@@ -30,7 +30,7 @@ export const websocketService = {
     statusListeners.add(listener)
     return () => statusListeners.delete(listener)
   },
-  connect() {
+  connect(options: { force?: boolean } = {}) {
     if (env.enableMock) {
       emitStatus('mock')
       return
@@ -42,9 +42,15 @@ export const websocketService = {
       return
     }
 
-    if (socket && (socket.readyState === WebSocket.CONNECTING || socket.readyState === WebSocket.OPEN)) {
+    if (!options.force && socket && (socket.readyState === WebSocket.CONNECTING || socket.readyState === WebSocket.OPEN)) {
       return
     }
+
+    window.clearTimeout(reconnectTimer)
+    reconnectTimer = undefined
+    const previousSocket = socket
+    socket = null
+    previousSocket?.close()
 
     shouldReconnect = true
     emitStatus('connecting')
