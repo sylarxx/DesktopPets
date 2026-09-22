@@ -30,7 +30,8 @@
         "resizable": false,
         "visible": false,
         "skipTaskbar": true,
-        "center": false
+        "center": false,
+        "focus": false
       },
       {
         "label": "panel",
@@ -49,7 +50,8 @@
         "resizable": false,
         "visible": false,
         "skipTaskbar": true,
-        "center": false
+        "center": false,
+        "focus": false
       },
       {
         "label": "mascot-menu",
@@ -68,7 +70,8 @@
         "resizable": false,
         "visible": false,
         "skipTaskbar": true,
-        "center": false
+        "center": false,
+        "focus": false
       },
       {
         "label": "mascot-notification",
@@ -87,7 +90,8 @@
         "resizable": false,
         "visible": false,
         "skipTaskbar": true,
-        "center": false
+        "center": false,
+        "focus": false
       }
     ],
     "security": {
@@ -110,7 +114,10 @@
     "windows": {
       "nsis": {
         "installMode": "currentUser",
-        "languages": ["SimpChinese", "English"],
+        "languages": [
+          "SimpChinese",
+          "English"
+        ],
         "installerIcon": "icons/icon.ico",
         "uninstallerIcon": "icons/icon.ico",
         "installerHooks": "windows/installer-hooks.nsh"
@@ -123,7 +130,9 @@
   "plugins": {
     "deep-link": {
       "desktop": {
-        "schemes": ["huali-ai-mascot"]
+        "schemes": [
+          "huali-ai-mascot"
+        ]
       }
     }
   }

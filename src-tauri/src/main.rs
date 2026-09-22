@@ -1032,40 +1032,11 @@ fn harden_transparent_window(window: &tauri::WebviewWindow) {
 }
 
 fn show_window_without_activation(window: &tauri::WebviewWindow) -> Result<(), String> {
-    #[cfg(windows)]
-    {
-        use windows_sys::Win32::UI::WindowsAndMessaging::{
-            SetWindowPos, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER,
-            SWP_SHOWWINDOW,
-        };
-
-        let hwnd = window
-            .hwnd()
-            .map_err(|error| format!("failed to access non-activating window HWND: {error}"))?;
-        let shown = unsafe {
-            SetWindowPos(
-                hwnd.0,
-                std::ptr::null_mut(),
-                0,
-                0,
-                0,
-                0,
-                SWP_NOACTIVATE
-                    | SWP_NOMOVE
-                    | SWP_NOOWNERZORDER
-                    | SWP_NOSIZE
-                    | SWP_NOZORDER
-                    | SWP_SHOWWINDOW,
-            )
-        };
-        if shown == 0 {
-            Err("failed to show native window without activation".to_string())
-        } else {
-            Ok(())
-        }
-    }
-
-    #[cfg(not(windows))]
+    // All desktop windows are created with focus:false. In the pinned Tao
+    // Windows runtime this selects SW_SHOWNOACTIVATE while keeping its VISIBLE
+    // flag synchronized. A raw SWP_SHOWWINDOW bypassed that flag, so a later
+    // hide could become a no-op and a style change could hide a visible card.
+    // Explicit user actions call set_focus separately in show_interactive_window.
     window
         .show()
         .map_err(|error| format!("failed to show window: {error}"))

@@ -61,7 +61,8 @@ function Test-ReadySnapshot($Snapshot, $Sequence) {
     $view = $property.Value
     if ($view.sequence -ne $Sequence -or -not $view.domPresent -or -not $view.mounted) { return $false }
   }
-  return $Snapshot.mascot.nativeVisible -and $Snapshot.mascot.interactive -and $Snapshot.mascot.draftPresent
+  return $Snapshot.mascot.nativeVisible -and $Snapshot.mascot.interactive -and $Snapshot.mascot.draftPresent -and
+    $Snapshot.'mascot-notification'.nativeVisible -and -not $Snapshot.'mascot-menu'.nativeVisible -and -not $Snapshot.panel.nativeVisible
 }
 
 function Get-OwnedWebViewProcesses([int]$RootProcessId) {
@@ -137,12 +138,18 @@ try {
       }
       $after = Wait-RuntimeSnapshot {
         param($s, $seq)
-        (Test-ReadySnapshot $s $seq) -and (
+        (Test-ReadySnapshot $s $seq) -and
+        ($s.'mascot-notification'.nativeVisible -eq $before.'mascot-notification'.nativeVisible) -and (
           ($caseName -eq 'session-lock-unlock' -and $s.mascot.epoch -gt $before.mascot.epoch) -or
           ($caseName -ne 'session-lock-unlock' -and $s.mascot.recovered)
         )
       }
       $case.recoverySeconds = [Math]::Round(([DateTime]::UtcNow - $started).TotalSeconds, 2)
+      $case.afterRecovery = $after
+      if ($after.panel.nativeVisible -ne $before.panel.nativeVisible) { throw 'Recovery changed the hidden input panel visibility.' }
+      foreach ($label in $labels) {
+        if ($after.$label.focused -and -not $before.$label.focused) { throw "Recovery stole focus: $label" }
+      }
       if ($after.mascot.processId -ne $script:runtimeProcess.Id) { throw 'Recovery restarted the main process.' }
       if ($caseName -eq 'browser-exit' -and $after.mascot.generation -le $before.mascot.generation) { throw 'Browser exit did not rebuild the native WebView.' }
       # Deliver a real mouse event at the recovered mascot, then require a fresh JS receipt.

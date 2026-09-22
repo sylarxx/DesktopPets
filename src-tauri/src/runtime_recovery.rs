@@ -610,6 +610,7 @@ pub fn desktop_runtime_smoke_receipt(
     };
     // Window getters must precede locks: they may marshal to the UI thread.
     let visible = window.is_visible().unwrap_or(false);
+    let focused = window.is_focused().unwrap_or(false);
     let position = window.outer_position().ok();
     let size = window.outer_size().ok();
     let runtime = window.state::<DesktopRuntime>();
@@ -625,6 +626,7 @@ pub fn desktop_runtime_smoke_receipt(
             "interactive": h.interactive, "repairs": view.repairs,
             "generation": view.native_generation, "mounted": view.application_ready,
             "recovered": view.recovered, "nativeVisible": visible,
+            "focused": focused,
             "position": position, "size": size,
         })
     };
