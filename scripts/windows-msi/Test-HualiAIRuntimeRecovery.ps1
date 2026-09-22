@@ -147,6 +147,7 @@ try {
       }
       $case.recoverySeconds = [Math]::Round(([DateTime]::UtcNow - $started).TotalSeconds, 2)
       $case.afterRecovery = $after
+      if ($after.mascot.foregroundIsApp) { throw 'Recovery activated the desktop assistant instead of preserving the foreground application.' }
       if ($after.panel.nativeVisible -ne $before.panel.nativeVisible) { throw 'Recovery changed the hidden input panel visibility.' }
       foreach ($label in $labels) {
         if ($after.$label.focused -and -not $before.$label.focused) { throw "Recovery stole focus: $label" }

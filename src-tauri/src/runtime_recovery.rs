@@ -645,6 +645,17 @@ pub fn desktop_runtime_smoke_receipt(
     // Window getters must precede locks: they may marshal to the UI thread.
     let visible = window.is_visible().unwrap_or(false);
     let focused = window.is_focused().unwrap_or(false);
+    #[cfg(windows)]
+    let foreground_is_app = unsafe {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            GetForegroundWindow, GetWindowThreadProcessId,
+        };
+        let mut owner = 0;
+        GetWindowThreadProcessId(GetForegroundWindow(), &mut owner);
+        owner == std::process::id()
+    };
+    #[cfg(not(windows))]
+    let foreground_is_app = false;
     let position = window.outer_position().ok();
     let size = window.outer_size().ok();
     let runtime = window.state::<DesktopRuntime>();
@@ -661,6 +672,7 @@ pub fn desktop_runtime_smoke_receipt(
             "generation": view.native_generation, "mounted": view.application_ready,
             "recovered": view.recovered, "nativeVisible": visible,
             "focused": focused,
+            "foregroundIsApp": foreground_is_app,
             "position": position, "size": size,
         })
     };
