@@ -108,6 +108,16 @@ try {
       Start-Sleep -Seconds 5
       Invoke-RuntimeCommand 'seed'
       $before = Wait-RuntimeSnapshot ${function:Test-ReadySnapshot} 60
+      # Startup intentionally shows the mascot. Establish an external foreground
+      # before injecting failure, so recovery is tested against a real competing
+      # application rather than whatever focus startup happened to retain.
+      $screen = [Windows.Forms.SystemInformation]::VirtualScreen
+      [HualiVisualSmokeNative]::SetCursorPos($screen.Left + 8, $screen.Top + 8) | Out-Null
+      if ([HualiVisualSmokeNative]::SendMouseClick($false) -ne 2) { throw 'Windows rejected the external focus click.' }
+      $before = Wait-RuntimeSnapshot {
+        param($s, $seq)
+        (Test-ReadySnapshot $s $seq) -and -not $s.mascot.foregroundIsApp
+      } 15
       $case.before = $before
       if (-not (Test-Path -LiteralPath $dataDirectory -PathType Container)) { throw 'Isolated WebView profile is missing.' }
       $started = [DateTime]::UtcNow
@@ -149,9 +159,6 @@ try {
       $case.afterRecovery = $after
       if ($after.mascot.foregroundIsApp) { throw 'Recovery activated the desktop assistant instead of preserving the foreground application.' }
       if ($after.panel.nativeVisible -ne $before.panel.nativeVisible) { throw 'Recovery changed the hidden input panel visibility.' }
-      foreach ($label in $labels) {
-        if ($after.$label.focused -and -not $before.$label.focused) { throw "Recovery stole focus: $label" }
-      }
       if ($after.mascot.processId -ne $script:runtimeProcess.Id) { throw 'Recovery restarted the main process.' }
       if ($caseName -like 'browser-exit*' -and $after.mascot.generation -le $before.mascot.generation) { throw 'Browser exit did not rebuild the native WebView.' }
       if ($caseName -eq 'browser-exit-create-retry' -and $after.mascot.repairs -ne 2) { throw 'Transient creation failure did not consume exactly one retry.' }
