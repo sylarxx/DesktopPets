@@ -38,3 +38,21 @@
 健康日志位于当前用户应用日志目录的 `runtime-health.jsonl`，达到 256 KiB 后轮转，最多保留当前文件和一个备份。旧的带敏感字段的诊断 writer 保持关闭。日志中 `session-inactive/session-interactive`、`renderer-process-failed/browser-process-failed`、`renderer-reload/window-recreate`、`renderer-mounted-after-repair` 可区分后续故障分支。
 
 原问题机验收应保留真实锁屏过夜，并在解锁前后产生新的有效提醒；同时检查单击输入、双击工作台、拖动、托盘、任务和草稿。已有超过 30 分钟的消息不补弹属于现有产品规则。
+
+## 本次 Windows 交付验收
+
+2026-09-22，程序提交 `c332b6a729841e02d7e12e3f2ba5485943a05b04` 的 [Windows/MSVC 流水线 35698299827](https://github.com/sylarxx/DesktopPets/actions/runs/35698299827) 全部通过。包括 137 项前端定向测试、9 个源码组合场景、原生窗口与健康状态测试、Clippy，以及实际 MSI 的 1.0.53 升级、登录协议回调、默认启动、鼠标/窗口检查和卸载。
+
+| Windows 故障注入 | 本轮完成时间 | 结果 |
+| --- | --- | --- |
+| 模拟原生锁屏/解锁状态 | 42.14 秒，含 40 秒锁定 | 锁定期间未消耗恢复次数；解锁后恢复 |
+| 实际阻塞机器人 JavaScript | 76.32 秒 | 原生监测触发界面恢复 |
+| 终止所属 WebView2 渲染进程 | 7.25 秒 | 界面恢复 |
+| 终止所属 WebView2 浏览器进程 | 11.27 秒 | 重建窗口并恢复 |
+| 浏览器退出并注入一次创建失败 | 45.87 秒 | 第二次创建成功，未无限重试 |
+
+以上是该次 CI 机器上的观测值，包含检查轮询时间，不是所有用户机器的恢复时限。每个场景均检查主程序 PID 不变、四个界面已挂载、草稿存在、卡片原生窗口可见、输入框和菜单保持隐藏，以及恢复后真实鼠标事件到达。
+
+故障注入前先通过实际鼠标操作把焦点移到应用外；恢复后用 Windows `GetForegroundWindow` 所属进程再次确认未激活助手。此项与截图、DOM 回执分别检查，不能仅凭某一个 WebView 报告自己没有焦点判定通过。
+
+程序二进制和 MSI 均以该次通过的构建为准。之后的交付整理只补齐压缩包中的 `Test-HualiAIRuntimeRecovery.ps1` 并记录验收结果，不改动 MSI；本地交付目录保存重新核对后的 MSI 和 ZIP 校验值。
