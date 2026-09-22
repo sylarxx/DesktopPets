@@ -112,11 +112,13 @@ const socketStatus = ref(env.enableMock ? 'mock' : 'closed')
 const currentSysMessage = ref<ResolvedSysMessage | null>(
   savedMascot?.current && !isSysMessageExpired(savedMascot.current.expiresAt) ? savedMascot.current : null,
 )
-const sysMessageQueue = ref<ResolvedSysMessage[]>(Array.isArray(savedMascot?.queue) ? savedMascot.queue.filter(m => !isSysMessageExpired(m.expiresAt)) : [])
-const deferredSysMessages = ref<ResolvedSysMessage[]>(Array.isArray(savedMascot?.deferred) ? savedMascot.deferred.filter(m => !isSysMessageExpired(m.expiresAt)) : [])
+const sysMessageQueue = ref<ResolvedSysMessage[]>(Array.isArray(savedMascot?.queue) ? savedMascot.queue.filter(m => m && typeof m.dedupeKey === 'string' && !isSysMessageExpired(m.expiresAt)) : [])
+const deferredSysMessages = ref<ResolvedSysMessage[]>(Array.isArray(savedMascot?.deferred) ? savedMascot.deferred.filter(m => m && typeof m.dedupeKey === 'string' && !isSysMessageExpired(m.expiresAt)) : [])
 const runtimeInteractive = ref(true)
 let removeRuntimeRecovery: (() => void) | undefined
 let runtimeRecovered = false
+let runtimeInitialStateAccepted = false
+let suppressRecoveredPresentation = false
 let runtimeCoordinatorReady = false
 let pendingRuntimeState: RuntimeState | undefined
 const sysMessageReadPendingKey = ref('')
@@ -162,7 +164,7 @@ let systemNotificationMessageKey = ''
 // Right-click “隐藏” suppresses only the presentation the user has already
 // seen. A later auth cycle or a newly delivered reminder receives a new key and
 // may wake the assistant, preserving the product promise on the menu action.
-let userHiddenSystemNotificationKey = savedMascot?.hiddenKey || ''
+let userHiddenSystemNotificationKey = typeof savedMascot?.hiddenKey === 'string' ? savedMascot.hiddenKey : ''
 const systemNotificationWindowReady = ref(false)
 const contextMenuWindowVisible = ref(false)
 const visibleSystemNotification = ref<MascotSystemNotificationPresentation | null>(null)
@@ -196,9 +198,9 @@ const notificationDelivery = createNotificationDelivery<MascotSystemNotification
 })
 let isDeliveringDeferredTasks = false
 const panelTaskStateReady = ref(false)
-const deferredTaskEvents: TaskCreatedEvent[] = Array.isArray(savedMascot?.tasks) ? savedMascot.tasks : []
+const deferredTaskEvents: TaskCreatedEvent[] = Array.isArray(savedMascot?.tasks) ? savedMascot.tasks.filter(task => task && typeof task.eventId === 'string' && task.payload && typeof task.payload.taskId === 'string') : []
 const panelHasTask = ref(false)
-const panelSessionEpoch = ref<number | null>(savedPanel?.sessionEpoch ?? null)
+const panelSessionEpoch = ref<number | null>(Number.isSafeInteger(savedPanel?.sessionEpoch) ? savedPanel!.sessionEpoch : null)
 let taskSessionEpoch = Number.isSafeInteger(savedMascot?.sessionEpoch) ? savedMascot!.sessionEpoch : Date.now()
 let mascotInteractionReadyResolved = false
 let resolveMascotInteractionReady: (() => void) | undefined
@@ -246,12 +248,12 @@ const isCurrentSysMessageReadPending = computed(
 const pendingSysMessageCount = computed(() => sysMessageQueue.value.length)
 
 if (savedPanel && Array.isArray(savedPanel.tasks)) {
-  taskStore.taskQueue = savedPanel.tasks.map(task => ({
+  taskStore.taskQueue = savedPanel.tasks.filter(task => task && typeof task.eventId === 'string' && task.payload && typeof task.payload.taskId === 'string').map(task => ({
     ...task, handling: false,
     error: task.handling ? '上次操作结果尚未确认，请先查看工作台' : task.error,
   }))
   taskStore.currentTask = taskStore.taskQueue[0] ?? null
-  taskStore.receivedEventIds = Array.isArray(savedPanel.receivedEventIds) ? savedPanel.receivedEventIds : []
+  taskStore.receivedEventIds = Array.isArray(savedPanel.receivedEventIds) ? savedPanel.receivedEventIds.filter(id => typeof id === 'string').slice(-256) : []
 }
 
 function persistRecoveryState() {
@@ -311,6 +313,12 @@ function recoverDesktopRuntime(state: RuntimeState) {
   deferredSysMessages.value = []
   contextMenuWindowVisible.value = false
   const presentation = buildSystemNotificationPresentation()
+  if (suppressRecoveredPresentation) {
+    // A tray hide can happen while the old renderer is stuck and unable to
+    // save its hide key. Honor the native snapshot once in the new renderer.
+    userHiddenSystemNotificationKey = systemNotificationMessageKey
+    suppressRecoveredPresentation = false
+  }
   notificationDelivery.recover(`native:${state.epoch}`, systemNotificationMessageKey === userHiddenSystemNotificationKey ? null : presentation)
   connectDesktopSockets({ force: true, catchUp: true })
   requestPanelTaskState()
@@ -1223,6 +1231,10 @@ function queueDesktopReleaseSmokeReminders() {
 
 onMounted(async () => {
   removeRuntimeRecovery = await startRuntimeRecovery((state) => {
+    if (!runtimeInitialStateAccepted) {
+      runtimeInitialStateAccepted = true
+      suppressRecoveredPresentation = state.recovered && !state.visible
+    }
     if (Number.isSafeInteger(state.deliveryGeneration)) {
       systemNotificationSyncGeneration = Math.max(systemNotificationSyncGeneration, state.deliveryGeneration!)
     }

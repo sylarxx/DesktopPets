@@ -10,7 +10,9 @@ if ($env:OS -ne 'Windows_NT') { throw 'Windows is required.' }
 $runtimeExecutable = (Resolve-Path -LiteralPath $ExecutablePath).Path
 $runtimeOutput = [IO.Path]::GetFullPath($OutputDirectory)
 New-Item -ItemType Directory -Path $runtimeOutput -Force | Out-Null
-& "$PSScriptRoot/Test-HualiAIWindowsVisualSmoke.ps1" -CompileBackdropOnly
+if (-not ('HualiVisualSmokeNative' -as [type])) {
+  & "$PSScriptRoot/Test-HualiAIWindowsVisualSmoke.ps1" -CompileBackdropOnly
+}
 
 $labels = @('mascot', 'panel', 'mascot-menu', 'mascot-notification')
 $script:receiptSequence = 0
@@ -100,12 +102,12 @@ try {
     $case = [ordered]@{ name = $caseName; passed = $false; killedOwnedProcessIds = @() }
     $report.cases += $case
     $script:runtimeProcess = Start-Process -FilePath $runtimeExecutable -PassThru
+    $dataDirectory = Join-Path ([IO.Path]::GetTempPath()) "huali-ai-visual-smoke-$($script:runtimeProcess.Id)"
     try {
       Start-Sleep -Seconds 5
       Invoke-RuntimeCommand 'seed'
       $before = Wait-RuntimeSnapshot ${function:Test-ReadySnapshot} 60
       $case.before = $before
-      $dataDirectory = Join-Path ([IO.Path]::GetTempPath()) "huali-ai-visual-smoke-$($script:runtimeProcess.Id)"
       if (-not (Test-Path -LiteralPath $dataDirectory -PathType Container)) { throw 'Isolated WebView profile is missing.' }
       $started = [DateTime]::UtcNow
       switch ($caseName) {
@@ -166,6 +168,10 @@ try {
         Copy-Item -LiteralPath $script:receiptPath -Destination (Join-Path $runtimeOutput "$caseName-receipt.json") -Force
       }
       Start-Sleep -Seconds 2
+      if (Test-Path -LiteralPath $dataDirectory) {
+        Remove-Item -LiteralPath $dataDirectory -Recurse -Force
+      }
+      Remove-Item -LiteralPath $script:receiptPath -Force -ErrorAction SilentlyContinue
     }
   }
   $report.passed = $true

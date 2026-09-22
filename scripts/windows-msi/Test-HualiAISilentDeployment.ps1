@@ -14,6 +14,8 @@ param(
 
   [switch]$RunVisualSmoke,
 
+  [switch]$RunRuntimeRecovery,
+
   [string]$VisualSmokeOutputDirectory = '',
 
   [switch]$ValidateDefaultLaunch,
@@ -1022,7 +1024,7 @@ try {
       }
       Write-Warning '当前 runner 无 Explorer：已验证辅助程序 SKIP 日志、不误启动进程与 HKLM Run 兜底；仍需在真实登录用户的 Windows 上执行交互默认启动门禁。'
     }
-  } elseif ($RunVisualSmoke) {
+  } elseif ($RunVisualSmoke -or $RunRuntimeRecovery) {
     Invoke-Install `
       -ResolvedMsi $resolvedMsi `
       -LogPath (Join-Path $resolvedEvidence '04-current-visual-install.log') `
@@ -1050,6 +1052,15 @@ try {
       outputDirectory = $resolvedVisualEvidence
       completed = $true
     }
+  }
+
+  if ($RunRuntimeRecovery) {
+    Assert-NoHualiProcesses -Stage '原生故障恢复测试启动前'
+    & (Join-Path $PSScriptRoot 'Test-HualiAIRuntimeRecovery.ps1') `
+      -ExecutablePath $lastExecutablePath `
+      -OutputDirectory (Join-Path $resolvedEvidence 'windows-runtime-recovery')
+    Assert-NoHualiProcesses -Stage '原生故障恢复测试结束'
+    $report.checks.runtimeRecovery = [ordered]@{ completed = $true }
   }
 
   $finalProducts = @(Get-InstalledProducts)

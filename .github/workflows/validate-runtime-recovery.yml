@@ -1,8 +1,7 @@
 name: Validate Windows runtime recovery
 
 on:
-  push:
-    branches: [codex/lock-screen-recovery-1.0.54]
+  workflow_dispatch:
 
 permissions:
   contents: read

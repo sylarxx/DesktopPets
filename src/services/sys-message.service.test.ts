@@ -305,4 +305,27 @@ describe('sysMessageService', () => {
     expect(mocks.get).toHaveBeenCalledTimes(2)
   })
 
+  it('解锁强制重连后补取多页，保留去重且拒绝旧连接迟到消息', async () => {
+    const page = Array.from({ length: 20 }, (_, i) => ({ id: i + 1, createTime: '2026-07-14 10:00:00' }))
+    mocks.get.mockResolvedValue({ rows: [page[0]] })
+    const listener = vi.fn()
+    const remove = sysMessageService.onMessage(listener)
+    sysMessageService.connect('same-user')
+    await vi.advanceTimersByTimeAsync(0)
+    const old = FakeWebSocket.instances[0]
+    mocks.get.mockReset().mockImplementation(async (_path, options) => ({
+      rows: options.params.pageNum === 1 ? page : [{ id: 21, createTime: '2026-07-14 10:01:00' }],
+    }))
+    sysMessageService.connect('same-user', { force: true, catchUp: true })
+    old.message({ type: 'sys_message', id: 'stale', msgSubject: 'old' })
+    old.serverClose()
+    await vi.advanceTimersByTimeAsync(0)
+    expect(FakeWebSocket.instances).toHaveLength(2)
+    expect(mocks.get).toHaveBeenCalledTimes(2)
+    expect(listener.mock.calls.map(([message]) => message.id)).toEqual(Array.from({ length: 21 }, (_, i) => String(i + 1)))
+    expect(new Set(listener.mock.calls.slice(1).map(([message]) => message.attentionKey)).size).toBe(1)
+    expect(mocks.put).not.toHaveBeenCalled()
+    remove()
+  })
+
 })

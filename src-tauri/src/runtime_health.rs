@@ -152,9 +152,6 @@ impl RuntimeHealth {
             || visible
             || view.requested
             || (view.recovered && !view.application_ready);
-        if !required {
-            return None;
-        }
         let js_failed = now.saturating_sub(view.last_js) > RESPONSE_TIMEOUT_MS;
         let paint_failed = visible
             && now.saturating_sub(view.last_paint.max(view.visible_since)) > RESPONSE_TIMEOUT_MS;
@@ -163,6 +160,9 @@ impl RuntimeHealth {
             if !view.instance.is_empty() && now.saturating_sub(*since) >= HEALTHY_RESET_MS {
                 view.repairs = 0;
             }
+            return None;
+        }
+        if !required {
             return None;
         }
         view.healthy_since = None;
@@ -251,5 +251,48 @@ mod tests {
         );
         h.request("mascot-notification", true);
         assert_eq!(h.inspect("mascot-notification", false, 900_000), None);
+    }
+
+    #[test]
+    fn runtime_health_hidden_but_responsive_window_resets_budget_after_sustained_health() {
+        let mut h = RuntimeHealth::default();
+        h.request("mascot-notification", true);
+        assert_eq!(
+            h.inspect("mascot-notification", false, 36_000),
+            Some(Repair::Recreate)
+        );
+        assert!(h.attach("mascot-notification", "new-card", 40_000));
+        h.views
+            .get_mut("mascot-notification")
+            .unwrap()
+            .application_ready = true;
+        for now in (40_000..=165_000).step_by(5_000) {
+            h.views.get_mut("mascot-notification").unwrap().sequence += 1;
+            let sequence = h.views["mascot-notification"].sequence;
+            assert!(h.ack(
+                "mascot-notification",
+                "new-card",
+                h.epoch,
+                sequence,
+                false,
+                now
+            ));
+            assert_eq!(h.inspect("mascot-notification", false, now), None);
+        }
+        assert_eq!(h.views["mascot-notification"].repairs, 0);
+        h.request("mascot-notification", false);
+        assert_eq!(
+            h.inspect("mascot-notification", false, 170_000),
+            Some(Repair::Reload)
+        );
+    }
+
+    #[test]
+    fn runtime_health_live_javascript_without_completed_app_mount_is_not_healthy() {
+        let mut h = RuntimeHealth::default();
+        h.attach("mascot", "incomplete", 0);
+        h.views.get_mut("mascot").unwrap().sequence = 1;
+        assert!(h.ack("mascot", "incomplete", h.epoch, 1, true, 36_000));
+        assert_eq!(h.inspect("mascot", true, 36_000), Some(Repair::Reload));
     }
 }
