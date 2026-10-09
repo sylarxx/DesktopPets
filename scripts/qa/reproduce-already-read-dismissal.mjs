@@ -70,6 +70,7 @@ function actionsFrom(source, service) {
     sysMessageReadPendingKey: pending, sysMessageReadAllPending: allPending, sysMessageActionError: error,
     sysMessageUserId: owner, sysMessageService: service, ...expiry, ...dismissal, ...errors,
     sysMessageEnrichmentGeneration: 1, isSysMessagePreview: false,
+    recordDesktopDiagnostic() {},
     isCurrentSysMessageReadPending: { get value() { return allPending.value || current.value?.dedupeKey === pending.value; } },
     emitTo() {}, hidePanelWindow() {}, deliverTasksWhenSystemMessagesFinish() {}, console: { warn() {} },
   };

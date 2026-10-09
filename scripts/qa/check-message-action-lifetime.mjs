@@ -15,6 +15,7 @@ function harness(){
  const context={sysMessageReadPendingKey:pending,sysMessageReadAllPending:all,currentSysMessage:current,sysMessageActionError:error,sysMessageQueue:queue,
   isCurrentSysMessageReadPending:{get value(){return all.value||current.value?.dedupeKey===pending.value}},
   isSysMessagePreview:false,sysMessageEnrichmentGeneration:1,
+  recordDesktopDiagnostic(){},
   sysMessageUserId:{value:'test-user'},deferredSysMessages:deferredMessages,
   dismissSysMessage(userId,m,expiresAt){dismissals.push({userId,id:m.id,expiresAt});return true},
   formatSysMessageActionError(){return '未能同步消息已读状态，可重试或关闭提醒'},

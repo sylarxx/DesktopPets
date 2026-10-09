@@ -70,6 +70,7 @@ function harness(source, { readId = 101, failure } = {}) {
     sysMessageEnrichmentGeneration: 1,
     hideCurrentSysMessage(selected) { if (current.value?.id === selected.id) current.value = null; },
     ...feedback,
+    recordDesktopDiagnostic() {},
     console: { warn() {} },
   };
   const handle = new Function(...Object.keys(context), compile(declaration(source.app, 'handleSysMessageRead'))

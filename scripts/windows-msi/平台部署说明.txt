@@ -21,9 +21,6 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Install-HualiAI.ps1 -M
 该脚本会等待安装完成、传回 Windows Installer 返回码，并将详细日志写入：
 C:\ProgramData\HualiAI\Logs\install-YYYYMMDD-HHMMSS.log
 
-安装后启动日志：
-C:\ProgramData\HualiAI\Logs\launch-after-install.log
-
 如管理平台只接受 msiexec，可直接使用：
 
 msiexec.exe /i "Huali-AI-Desktop-Assistant_xxx_x64-enterprise.msi" /qn /norestart REBOOT=ReallySuppress /L*v "C:\Windows\Temp\HualiAI-install.log"

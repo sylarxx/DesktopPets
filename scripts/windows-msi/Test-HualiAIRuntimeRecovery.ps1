@@ -64,33 +64,28 @@ function Test-ReadySnapshot($Snapshot, $Sequence) {
   return $Snapshot.mascot.nativeVisible -and $Snapshot.mascot.interactive -and $Snapshot.mascot.draftPresent -and
     $Snapshot.mascot.notificationVisible -and
     $Snapshot.'mascot-notification'.nativeVisible -and $Snapshot.'mascot-notification'.cardPresent -and
+    $Snapshot.'mascot-notification'.paintConfirmationCount -gt 0 -and
+    $Snapshot.'mascot-notification'.paintConfirmationEpoch -ge $Snapshot.mascot.epoch -and
     -not $Snapshot.'mascot-menu'.nativeVisible -and -not $Snapshot.panel.nativeVisible
 }
 
-function Wait-NotificationPaintReceipt([long]$MinimumEpoch, [long]$AfterElapsedMs = -1) {
+function Wait-NotificationPaintReceipt([long]$MinimumEpoch, [long]$AfterCount = 0) {
   # Native show alone used to pass this gate even when the card renderer was
   # empty or suspended. Require the real post-show two-frame ACK from this PID
-  # and recovery epoch, with a fresh receipt after the pre-fault watermark.
-  $deadline = [DateTime]::UtcNow.AddSeconds(20)
-  $logRoot = Join-Path $env:LOCALAPPDATA 'com.huali.ai.mascot'
-  do {
-    if (Test-Path -LiteralPath $logRoot) {
-      $logs = @(Get-ChildItem -LiteralPath $logRoot -Recurse -File -Filter 'runtime-health.jsonl*')
-      foreach ($log in $logs) {
-        foreach ($line in @(Get-Content -LiteralPath $log.FullName -ErrorAction SilentlyContinue)) {
-          try { $entry = $line | ConvertFrom-Json } catch { continue }
-          if ($entry.event -eq 'notification-visible-confirmed' -and
-              $entry.window -eq 'mascot-notification' -and
-              $entry.process_id -eq $script:runtimeProcess.Id -and
-              $entry.epoch -ge $MinimumEpoch -and $entry.elapsed_ms -gt $AfterElapsedMs) {
-            return $entry
-          }
-        }
-      }
-    }
-    Start-Sleep -Milliseconds 500
-  } while ([DateTime]::UtcNow -lt $deadline)
-  throw "No fresh post-show notification paint receipt for PID $($script:runtimeProcess.Id), epoch $MinimumEpoch."
+  # and recovery epoch. Evidence is an opt-in in-memory counter exposed only
+  # by the CI nonce snapshot, independent from any bounded runtime log.
+  $snapshot = Wait-RuntimeSnapshot {
+    param($s, $seq)
+    (Test-ReadySnapshot $s $seq) -and
+    $s.'mascot-notification'.processId -eq $script:runtimeProcess.Id -and
+    $s.'mascot-notification'.paintConfirmationEpoch -ge $MinimumEpoch -and
+    $s.'mascot-notification'.paintConfirmationCount -gt $AfterCount
+  } 20
+  return [ordered]@{
+    count = $snapshot.'mascot-notification'.paintConfirmationCount
+    epoch = $snapshot.'mascot-notification'.paintConfirmationEpoch
+    processId = $snapshot.'mascot-notification'.processId
+  }
 }
 
 function Get-OwnedWebViewProcesses([int]$RootProcessId) {
@@ -186,7 +181,7 @@ try {
       }
       $case.recoverySeconds = [Math]::Round(([DateTime]::UtcNow - $started).TotalSeconds, 2)
       $case.afterRecovery = $after
-      $case.paintAfter = Wait-NotificationPaintReceipt $after.mascot.epoch $case.paintBefore.elapsed_ms
+      $case.paintAfter = Wait-NotificationPaintReceipt $after.mascot.epoch $case.paintBefore.count
       if ($after.mascot.foregroundIsApp) { throw 'Recovery activated the desktop assistant instead of preserving the foreground application.' }
       if ($after.panel.nativeVisible -ne $before.panel.nativeVisible) { throw 'Recovery changed the hidden input panel visibility.' }
       if ($after.mascot.processId -ne $script:runtimeProcess.Id) { throw 'Recovery restarted the main process.' }
@@ -231,9 +226,4 @@ try {
     [Environment]::SetEnvironmentVariable($entry.Key, $entry.Value, 'Process')
   }
   $report | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath (Join-Path $runtimeOutput 'runtime-recovery.json') -Encoding UTF8
-  $logRoot = Join-Path $env:LOCALAPPDATA 'com.huali.ai.mascot'
-  if (Test-Path -LiteralPath $logRoot) {
-    Get-ChildItem -LiteralPath $logRoot -Recurse -File -Filter 'runtime-health.jsonl*' |
-      Copy-Item -Destination $runtimeOutput -Force
-  }
 }

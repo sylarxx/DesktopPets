@@ -8,12 +8,13 @@ function setup() {
   const hide = vi.fn(async () => true)
   const onVisible = vi.fn()
   const onStopped = vi.fn()
+  const onAttemptFailed = vi.fn()
   const confirmVisible = vi.fn(async (generation: number) => { delivery.acknowledgeVisible(generation) })
   const delivery = createNotificationDelivery<string>({
     nextGeneration: () => ++generation, key: (value) => value.split(':')[0],
-    publish, show, confirmVisible, hide, onVisible, onStopped,
+    publish, show, confirmVisible, hide, onVisible, onStopped, onAttemptFailed,
   })
-  return { delivery, publish, show, confirmVisible, hide, onVisible, onStopped }
+  return { delivery, publish, show, confirmVisible, hide, onVisible, onStopped, onAttemptFailed }
 }
 
 describe('bounded notification delivery', () => {
@@ -31,6 +32,52 @@ describe('bounded notification delivery', () => {
     expect(h.show).toHaveBeenCalledWith(1, 'meeting')
     expect(h.onVisible).toHaveBeenLastCalledWith('meeting')
     expect(vi.getTimerCount()).toBe(0)
+    expect(h.onAttemptFailed).not.toHaveBeenCalled()
+    h.delivery.dispose()
+  })
+
+  it.each(['layout', 'show', 'paint'] as const)('reports each failed %s attempt once without logging normal frames', async (phase) => {
+    const h = setup()
+    if (phase !== 'layout') h.publish.mockImplementation(async ({ generation }) => h.delivery.acknowledge(generation))
+    if (phase === 'show') h.show.mockResolvedValue(false)
+    if (phase === 'paint') h.confirmVisible.mockImplementation(async () => {})
+    h.delivery.sync('meeting')
+    await vi.advanceTimersByTimeAsync(10_000)
+    expect(h.onAttemptFailed).toHaveBeenCalledTimes(3)
+    expect(h.onAttemptFailed.mock.calls.map(call => call[0])).toEqual([phase, phase, phase])
+    expect(new Set(h.onAttemptFailed.mock.calls.map(call => call[1])).size).toBe(3)
+    expect(h.onStopped).toHaveBeenCalledOnce()
+    h.delivery.sync('meeting:duplicate')
+    await vi.advanceTimersByTimeAsync(10_000)
+    expect(h.onAttemptFailed).toHaveBeenCalledTimes(3)
+    h.delivery.dispose()
+  })
+
+  it('reports a hung native show at the deadline once and never reports its stale completion', async () => {
+    const h = setup()
+    let finish!: (value: boolean) => void
+    h.show.mockImplementationOnce(() => new Promise(resolve => { finish = resolve }))
+    h.delivery.sync('meeting')
+    h.delivery.acknowledge(1)
+    await vi.advanceTimersByTimeAsync(10_000)
+    expect(h.onAttemptFailed).toHaveBeenCalledExactlyOnceWith('show', 1)
+    finish(true)
+    await vi.advanceTimersByTimeAsync(0)
+    expect(h.onAttemptFailed).toHaveBeenCalledTimes(1)
+    h.delivery.dispose()
+  })
+
+  it('does not log a canceled batch and contains failures of the diagnostic hook', async () => {
+    const h = setup()
+    h.delivery.sync('old')
+    h.delivery.sync(null)
+    await vi.advanceTimersByTimeAsync(10_000)
+    expect(h.onAttemptFailed).not.toHaveBeenCalled()
+    h.onAttemptFailed.mockImplementation(() => { throw new Error('diagnostic unavailable') })
+    h.delivery.sync('new')
+    await vi.advanceTimersByTimeAsync(10_000)
+    expect(h.onAttemptFailed).toHaveBeenCalledTimes(3)
+    expect(h.onStopped).toHaveBeenCalledWith('new')
     h.delivery.dispose()
   })
 

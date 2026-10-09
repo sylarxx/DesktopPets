@@ -1,3 +1,5 @@
+import { invoke } from '@tauri-apps/api/core'
+
 type DiagnosticValue = string | number | boolean | null
 type DiagnosticFields = Record<string, DiagnosticValue>
 
@@ -75,12 +77,28 @@ export function getDiagnosticCredentialMetadata(
   }
 }
 
-/**
- * The P0 diagnostic build used this stable call site across renderer modules.
- * Formal releases intentionally keep it as a no-op so no user-local diagnostic
- * file can be recreated while the surrounding business instrumentation is
- * removed independently from product behavior.
- */
-export function recordDesktopDiagnostic(_event: string, _fields: DiagnosticFields = {}) {
-  // Intentionally disabled in formal releases.
+const RUNTIME_EVENTS: Record<string, string> = {
+  'notification.delivery.layout_unconfirmed': 'notification-layout-unconfirmed',
+  'notification.delivery.show_unconfirmed': 'notification-show-unconfirmed',
+  'notification.delivery.paint_unconfirmed': 'notification-paint-unconfirmed',
+  'notification.delivery.stopped': 'notification-delivery-stopped',
+  'message.read.reconciled': 'message-read-reconciled',
+  'message.read.unconfirmed': 'message-read-unconfirmed',
+  'reminder.poll.failed': 'reminder-poll-failed',
+  'reminder.websocket.failed': 'reminder-websocket-failed',
+}
+
+/** Only fixed failure events reach the bounded native log; legacy fields never leave JS. */
+export function recordDesktopDiagnostic(sourceEvent: string, fields: DiagnosticFields = {}) {
+  let event = Object.prototype.hasOwnProperty.call(RUNTIME_EVENTS, sourceEvent)
+    ? RUNTIME_EVENTS[sourceEvent] : undefined
+  if (sourceEvent === 'message.read.failed') {
+    event = fields.responseStatus === 401 || fields.businessCode === 401 ? 'message-read-unauthorized'
+      : fields.responseStatus === 403 || fields.businessCode === 403 ? 'message-read-forbidden'
+        : fields.timedOut === true ? 'message-read-timeout' : 'message-read-failed'
+  }
+  if (!event) return
+  try {
+    void invoke<boolean>('record_desktop_runtime_event', { event }).catch(() => {})
+  } catch { /* Diagnostic availability must never affect a click or recovery. */ }
 }

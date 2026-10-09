@@ -208,6 +208,9 @@ const notificationDelivery = createNotificationDelivery<MascotSystemNotification
   hide: (generation) => hideMascotSystemNotificationWindow(generation),
   key: (presentation) => presentation.kind === 'auth' ? 'auth' : presentation.message.dedupeKey,
   onStopped: handleNotificationStopped,
+  onAttemptFailed: (phase, generation) => recordDesktopDiagnostic(
+    `notification.delivery.${phase}_unconfirmed`, { generation },
+  ),
   onVisible: (presentation) => { visibleSystemNotification.value = presentation },
 })
 let isDeliveringDeferredTasks = false
@@ -294,6 +297,7 @@ watch([currentSysMessage, sysMessageQueue, deferredSysMessages, () => taskStore.
   persistRecoveryState, { deep: true, flush: 'sync' })
 
 function handleNotificationStopped(presentation: MascotSystemNotificationPresentation) {
+  recordDesktopDiagnostic('notification.delivery.stopped')
   if (presentation.kind === 'message' && currentSysMessage.value?.dedupeKey === presentation.message.dedupeKey) {
     const message = currentSysMessage.value
     if (!deferredSysMessages.value.some(item => item.dedupeKey === message.dedupeKey)) {
@@ -757,6 +761,11 @@ async function handleSysMessageRead(message: SysMessageNotification) {
   } catch (error) {
     if (actionSession !== sysMessageEnrichmentGeneration) return
     console.warn('Failed to mark sys_message as read', error)
+    recordDesktopDiagnostic('message.read.failed', {
+      responseStatus: (error as { status?: number } | null)?.status ?? null,
+      businessCode: (error as { code?: number } | null)?.code ?? null,
+      timedOut: error instanceof Error && (error.name === 'AbortError' || error.message.includes('超时')),
+    })
     if (currentSysMessage.value?.dedupeKey === message.dedupeKey) {
       sysMessageActionError.value = formatSysMessageActionError(error)
     }
@@ -803,6 +812,11 @@ async function handleAllSysMessagesRead() {
   } catch (error) {
     if (actionSession !== sysMessageEnrichmentGeneration) return
     console.warn('Failed to mark all sys_messages as read', error)
+    recordDesktopDiagnostic('message.read.failed', {
+      responseStatus: (error as { status?: number } | null)?.status ?? null,
+      businessCode: (error as { code?: number } | null)?.code ?? null,
+      timedOut: error instanceof Error && (error.name === 'AbortError' || error.message.includes('超时')),
+    })
     if (currentSysMessage.value && snapshotKeys.has(currentSysMessage.value.dedupeKey)) {
       sysMessageActionError.value = formatSysMessageActionError(error, { all: true })
     }
@@ -845,6 +859,11 @@ async function handleSysMessageView(message: SysMessageNotification) {
     } catch (error) {
       if (actionSession !== sysMessageEnrichmentGeneration) return
       console.warn('Failed to mark viewed sys_message as read', error)
+      recordDesktopDiagnostic('message.read.failed', {
+        responseStatus: (error as { status?: number } | null)?.status ?? null,
+        businessCode: (error as { code?: number } | null)?.code ?? null,
+        timedOut: error instanceof Error && (error.name === 'AbortError' || error.message.includes('超时')),
+      })
       if (currentSysMessage.value?.dedupeKey === message.dedupeKey) {
         sysMessageActionError.value = formatSysMessageActionError(error, { viewed: true })
       }

@@ -3,6 +3,8 @@ export interface NotificationDelivery<T> {
   presentation: T | null
 }
 
+export type NotificationDeliveryFailurePhase = 'layout' | 'show' | 'paint'
+
 interface NotificationDeliveryOptions<T> {
   nextGeneration: () => number
   key: (presentation: T) => string
@@ -12,6 +14,7 @@ interface NotificationDeliveryOptions<T> {
   hide: (generation: number) => Promise<boolean>
   onVisible: (presentation: T | null) => void
   onStopped?: (presentation: T) => void
+  onAttemptFailed?: (phase: NotificationDeliveryFailurePhase, generation: number) => void
 }
 
 // A message's recovery budget survives duplicate events, content updates and
@@ -33,6 +36,7 @@ export function createNotificationDelivery<T>(options: NotificationDeliveryOptio
   let retryTimer: ReturnType<typeof setTimeout> | undefined
   let deadlineTimer: ReturnType<typeof setTimeout> | undefined
   let pending: { generation: number; phase: 'layout' | 'paint'; finish: (ready: boolean) => void } | undefined
+  let activeAttempt: { token: number; generation: number; phase: NotificationDeliveryFailurePhase; reported: boolean } | undefined
 
   function cancel() {
     intent += 1
@@ -40,6 +44,7 @@ export function createNotificationDelivery<T>(options: NotificationDeliveryOptio
     if (deadlineTimer !== undefined) clearTimeout(deadlineTimer)
     retryTimer = deadlineTimer = undefined
     pending?.finish(false)
+    activeAttempt = undefined
   }
   function isCurrent(token: number) { return !disposed && token === intent }
   function acknowledge(generation: number) {
@@ -73,6 +78,7 @@ export function createNotificationDelivery<T>(options: NotificationDeliveryOptio
   }
   function stop(token: number) {
     if (!isCurrent(token)) return
+    reportAttemptFailed(token)
     const budget = budgets.get(activeKey)
     const alreadyStopped = budget?.stopped
     if (budget) budget.stopped = true
@@ -82,6 +88,13 @@ export function createNotificationDelivery<T>(options: NotificationDeliveryOptio
     // Invalidate a native show still in flight; hiding never needs renderer ACK.
     void options.hide(options.nextGeneration()).catch(() => {})
     if (!alreadyStopped && latest !== null) options.onStopped?.(latest)
+  }
+  function reportAttemptFailed(token: number) {
+    if (!isCurrent(token) || activeAttempt?.token !== token || activeAttempt.reported) return
+    activeAttempt.reported = true
+    try { options.onAttemptFailed?.(activeAttempt.phase, activeAttempt.generation) } catch {
+      // Optional diagnostics must not interrupt bounded retries.
+    }
   }
   async function attempt(token: number) {
     if (!isCurrent(token) || latest === null) return
@@ -93,15 +106,18 @@ export function createNotificationDelivery<T>(options: NotificationDeliveryOptio
     budget.attempts += 1
     const presentation = latest
     const generation = options.nextGeneration()
+    activeAttempt = { token, generation, phase: 'layout', reported: false }
     let success = false
     try {
       const ready = await waitForReceipt(generation, 'layout', () => options.publish({ generation, presentation }))
       if (!isCurrent(token)) return
       if (ready) {
+        activeAttempt.phase = 'show'
         shownGeneration = generation
         success = await options.show(generation, presentation)
         if (!isCurrent(token)) return
         if (success) {
+          activeAttempt.phase = 'paint'
           success = await waitForReceipt(generation, 'paint', () => options.confirmVisible(generation))
           success = success && generation > revokedThroughGeneration
         }
@@ -109,6 +125,7 @@ export function createNotificationDelivery<T>(options: NotificationDeliveryOptio
     } catch { /* Retry only within this message's original budget. */ }
     if (!isCurrent(token)) return
     if (success) {
+      activeAttempt = undefined
       if (deadlineTimer !== undefined) clearTimeout(deadlineTimer)
       deadlineTimer = undefined
       budget.complete = true
@@ -119,6 +136,8 @@ export function createNotificationDelivery<T>(options: NotificationDeliveryOptio
       if (latest !== presentation) publishUpdate(token)
       return
     }
+    reportAttemptFailed(token)
+    activeAttempt = undefined
     visible = false
     options.onVisible(null)
     // A shown HWND with no current renderer receipt must not remain as an

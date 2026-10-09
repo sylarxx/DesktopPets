@@ -50,7 +50,56 @@ describe('desktop diagnostics', () => {
     expect(invokeMock).not.toHaveBeenCalled()
   })
 
-  it('removes legacy JSONL files at startup and keeps the native writer disabled', () => {
+  it('sends only the fixed runtime event and drops all legacy fields', async () => {
+    recordDesktopDiagnostic('notification.delivery.paint_unconfirmed', {
+      token: 'complete-token', userId: 'employee-123456', rawUrl: 'https://private/path',
+      messageContent: 'private message', generation: 123,
+    })
+    await Promise.resolve()
+    expect(invokeMock).toHaveBeenCalledExactlyOnceWith('record_desktop_runtime_event', {
+      event: 'notification-paint-unconfirmed',
+    })
+    recordDesktopDiagnostic('toString', { token: 'complete-token' })
+    recordDesktopDiagnostic('unknown.failure', { token: 'complete-token' })
+    expect(invokeMock).toHaveBeenCalledTimes(1)
+  })
+
+  it.each([
+    ['notification.delivery.layout_unconfirmed', 'notification-layout-unconfirmed'],
+    ['notification.delivery.show_unconfirmed', 'notification-show-unconfirmed'],
+    ['notification.delivery.paint_unconfirmed', 'notification-paint-unconfirmed'],
+    ['notification.delivery.stopped', 'notification-delivery-stopped'],
+    ['message.read.reconciled', 'message-read-reconciled'],
+    ['message.read.unconfirmed', 'message-read-unconfirmed'],
+    ['reminder.poll.failed', 'reminder-poll-failed'],
+    ['reminder.websocket.failed', 'reminder-websocket-failed'],
+  ])('maps %s to one fixed native event', (source, event) => {
+    recordDesktopDiagnostic(source, { token: 'discarded', messageId: 'discarded' })
+    expect(invokeMock).toHaveBeenCalledExactlyOnceWith('record_desktop_runtime_event', { event })
+  })
+
+  it('classifies read failures with fixed events and never passes status or error content', () => {
+    recordDesktopDiagnostic('message.read.failed', { responseStatus: 401, timedOut: true })
+    recordDesktopDiagnostic('message.read.failed', { businessCode: 403 })
+    recordDesktopDiagnostic('message.read.failed', { timedOut: true })
+    recordDesktopDiagnostic('message.read.failed', { error: 'raw private failure' })
+    expect(invokeMock.mock.calls).toEqual([
+      ['record_desktop_runtime_event', { event: 'message-read-unauthorized' }],
+      ['record_desktop_runtime_event', { event: 'message-read-forbidden' }],
+      ['record_desktop_runtime_event', { event: 'message-read-timeout' }],
+      ['record_desktop_runtime_event', { event: 'message-read-failed' }],
+    ])
+  })
+
+  it('does not let unavailable native logging affect the business caller', async () => {
+    invokeMock.mockRejectedValueOnce(new Error('native logging unavailable'))
+    expect(() => recordDesktopDiagnostic('message.read.unconfirmed')).not.toThrow()
+    await Promise.resolve()
+    invokeMock.mockImplementationOnce(() => { throw new Error('bridge unavailable') })
+    expect(() => recordDesktopDiagnostic('message.read.reconciled')).not.toThrow()
+  })
+
+  it('removes legacy JSONL files at startup and keeps the legacy native writer disabled', () => {
     const rendererWriter = diagnosticServiceSource.slice(
       diagnosticServiceSource.indexOf('export function recordDesktopDiagnostic'),
     )
@@ -59,7 +108,7 @@ describe('desktop diagnostics', () => {
       rustSource.indexOf('fn diagnostic_fields'),
     )
 
-    expect(rendererWriter).not.toContain('invoke<')
+    expect(rendererWriter).toContain("'record_desktop_runtime_event', { event }")
     expect(nativeWriter).toContain('false')
     expect(nativeWriter).not.toContain('OpenOptions')
     expect(nativeWriter).not.toContain('write_all')

@@ -1,6 +1,8 @@
 use crate::runtime_health::{Repair, RuntimeHealth, LABELS};
 use serde::Serialize;
 use std::collections::BTreeMap;
+use std::io::Write;
+use std::path::Path;
 use std::sync::{
     atomic::{AtomicBool, AtomicI8, AtomicU64, Ordering},
     mpsc, Mutex,
@@ -8,7 +10,62 @@ use std::sync::{
 use std::time::Instant;
 use tauri::{Emitter, Manager, PhysicalPosition, PhysicalSize, Position, Size};
 
-const MAIN_THREAD_STALL_TIMEOUT_MS: u64 = 25_000;
+const RUNTIME_LOG_FILE_LIMIT: u64 = 64 * 1024;
+
+#[derive(Serialize)]
+struct HealthEvent {
+    event: &'static str,
+    window: String,
+    epoch: u64,
+    elapsed_ms: u64,
+    time_ms: u64,
+    process_id: u32,
+}
+
+fn trim_oversized_runtime_logs(directory: &Path) -> std::io::Result<()> {
+    for name in ["runtime-health.jsonl", "runtime-health.jsonl.1"] {
+        let path = directory.join(name);
+        match std::fs::metadata(&path) {
+            Ok(metadata) if metadata.len() > RUNTIME_LOG_FILE_LIMIT => {
+                std::fs::remove_file(path)?;
+            }
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error),
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn write_runtime_event(directory: &Path, event: &HealthEvent) -> std::io::Result<()> {
+    let mut line = serde_json::to_vec(event)?;
+    line.push(b'\n');
+    if line.len() as u64 > RUNTIME_LOG_FILE_LIMIT {
+        return Ok(());
+    }
+    // Check before writing, including stale files created by earlier versions.
+    // This writer has exactly two fixed filenames, each capped at 64 KiB.
+    trim_oversized_runtime_logs(directory)?;
+    let path = directory.join("runtime-health.jsonl");
+    let old = directory.join("runtime-health.jsonl.1");
+    let length = match std::fs::metadata(&path) {
+        Ok(metadata) => metadata.len(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(error) => return Err(error),
+    };
+    if length + line.len() as u64 > RUNTIME_LOG_FILE_LIMIT {
+        match std::fs::remove_file(&old) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        std::fs::rename(&path, old)?;
+    }
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?
+        .write_all(&line)
+}
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -29,13 +86,10 @@ struct RecoveryWindow {
     mounted: bool,
 }
 
-#[derive(Serialize)]
-struct HealthEvent {
-    event: &'static str,
-    window: String,
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct SmokePaintConfirmation {
+    count: u64,
     epoch: u64,
-    elapsed_ms: u64,
-    process_id: u32,
 }
 
 pub struct DesktopRuntime {
@@ -43,11 +97,10 @@ pub struct DesktopRuntime {
     windows: Mutex<BTreeMap<String, RecoveryWindow>>,
     started: Instant,
     scheduled: AtomicBool,
-    scheduled_since: AtomicU64,
-    stall_reported: AtomicBool,
     smoke_session: AtomicI8,
     smoke_fail_creation: AtomicBool,
     last_resync: AtomicU64,
+    smoke_paint: Mutex<Option<SmokePaintConfirmation>>,
     log: Mutex<Option<mpsc::SyncSender<HealthEvent>>>,
 }
 
@@ -58,11 +111,10 @@ impl Default for DesktopRuntime {
             windows: Mutex::new(BTreeMap::new()),
             started: Instant::now(),
             scheduled: AtomicBool::new(false),
-            scheduled_since: AtomicU64::new(0),
-            stall_reported: AtomicBool::new(false),
             smoke_session: AtomicI8::new(-1),
             smoke_fail_creation: AtomicBool::new(false),
             last_resync: AtomicU64::new(0),
+            smoke_paint: Mutex::new(None),
             log: Mutex::new(None),
         }
     }
@@ -74,6 +126,71 @@ impl DesktopRuntime {
     }
     pub fn interactive(&self) -> bool {
         self.health.lock().map(|h| h.interactive).unwrap_or(false)
+    }
+
+    pub fn record(&self, event: &'static str, label: &str) {
+        if !matches!(
+            event,
+            "runtime-start"
+                | "session-interactive"
+                | "session-inactive"
+                | "renderer-attached-after-repair"
+                | "browser-process-failed"
+                | "renderer-process-failed"
+                | "missing-window-recreate"
+                | "renderer-reload"
+                | "window-recreate"
+                | "reload-command-failed"
+                | "destroy-command-failed"
+                | "window-configure-failed"
+                | "window-create-failed"
+                | "renderer-mounted-after-repair"
+                | "notification-visible-rejected"
+                | "notification-visible-receipt-failed"
+                | "session-observer-create-failed"
+                | "session-registration-failed"
+                | "session-timer-failed"
+                | "notification-layout-unconfirmed"
+                | "notification-show-unconfirmed"
+                | "notification-paint-unconfirmed"
+                | "notification-delivery-stopped"
+                | "message-read-reconciled"
+                | "message-read-unconfirmed"
+                | "message-read-unauthorized"
+                | "message-read-forbidden"
+                | "message-read-timeout"
+                | "message-read-failed"
+                | "reminder-poll-failed"
+                | "reminder-websocket-failed"
+                | "notification-not-ready-or-stale"
+                | "notification-state-unavailable"
+                | "notification-transition-unavailable"
+                | "notification-superseded"
+                | "notification-mascot-unavailable"
+                | "notification-mascot-hidden"
+                | "notification-window-unavailable"
+                | "notification-position-failed"
+                | "notification-native-show-failed"
+        ) || (!label.is_empty() && !LABELS.contains(&label))
+        {
+            return;
+        }
+        let epoch = self.health.lock().map(|h| h.epoch).unwrap_or(0);
+        if let Ok(sender) = self.log.lock() {
+            if let Some(sender) = sender.as_ref() {
+                let _ = sender.try_send(HealthEvent {
+                    event,
+                    window: label.into(),
+                    epoch,
+                    elapsed_ms: self.now(),
+                    time_ms: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|duration| duration.as_millis() as u64)
+                        .unwrap_or(0),
+                    process_id: std::process::id(),
+                });
+            }
+        }
     }
 
     fn state(&self, app: &tauri::AppHandle, label: &str) -> RuntimeState {
@@ -94,18 +211,19 @@ impl DesktopRuntime {
         }
     }
 
-    pub fn record(&self, event: &'static str, label: &str) {
+    pub fn confirm_notification_paint_for_smoke(&self) {
+        self.confirm_notification_paint(smoke_enabled());
+    }
+
+    fn confirm_notification_paint(&self, enabled: bool) {
+        if !enabled {
+            return;
+        }
         let epoch = self.health.lock().map(|h| h.epoch).unwrap_or(0);
-        if let Ok(sender) = self.log.lock() {
-            if let Some(sender) = sender.as_ref() {
-                let _ = sender.try_send(HealthEvent {
-                    event,
-                    window: label.into(),
-                    epoch,
-                    elapsed_ms: self.now(),
-                    process_id: std::process::id(),
-                });
-            }
+        if let Ok(mut confirmation) = self.smoke_paint.lock() {
+            let confirmation = confirmation.get_or_insert_with(SmokePaintConfirmation::default);
+            confirmation.count = confirmation.count.saturating_add(1);
+            confirmation.epoch = epoch;
         }
     }
 
@@ -123,59 +241,21 @@ impl DesktopRuntime {
             .map(|windows| windows.values().any(|s| s.recreate))
             .unwrap_or(false)
     }
-
-    fn queued_tick_stalled(&self, now: u64) -> bool {
-        let since = self.scheduled_since.load(Ordering::SeqCst);
-        self.scheduled.load(Ordering::SeqCst)
-            && since != 0
-            && now.saturating_sub(since) > MAIN_THREAD_STALL_TIMEOUT_MS
-            && !self.stall_reported.swap(true, Ordering::SeqCst)
-    }
-
-    fn finish_tick(&self) {
-        self.scheduled_since.store(0, Ordering::SeqCst);
-        self.stall_reported.store(false, Ordering::SeqCst);
-        self.scheduled.store(false, Ordering::SeqCst);
-    }
-
-    fn restart_pending_tick_grace(&self, now: u64) {
-        if self.scheduled.load(Ordering::SeqCst) {
-            self.scheduled_since.store(now.max(1), Ordering::SeqCst);
-            self.stall_reported.store(false, Ordering::SeqCst);
-        }
-    }
 }
 
 pub fn initialize(app: &tauri::AppHandle) {
-    // A separate allowlisted log. Never forward legacy diagnostic fields,
-    // message bodies, auth URLs or tokens to this writer.
     if let Ok(directory) = app.path().app_log_dir() {
-        let (sender, receiver) = mpsc::sync_channel::<HealthEvent>(64);
-        *app.state::<DesktopRuntime>().log.lock().unwrap() = Some(sender);
-        std::thread::spawn(move || {
-            use std::io::Write;
-            let _ = std::fs::create_dir_all(&directory);
-            let path = directory.join("runtime-health.jsonl");
-            for event in receiver {
-                if std::fs::metadata(&path)
-                    .map(|m| m.len() > 262_144)
-                    .unwrap_or(false)
-                {
-                    let old = directory.join("runtime-health.jsonl.1");
-                    let _ = std::fs::remove_file(&old);
-                    let _ = std::fs::rename(&path, old);
+        if std::fs::create_dir_all(&directory).is_ok()
+            && trim_oversized_runtime_logs(&directory).is_ok()
+        {
+            let (sender, receiver) = mpsc::sync_channel::<HealthEvent>(64);
+            *app.state::<DesktopRuntime>().log.lock().unwrap() = Some(sender);
+            std::thread::spawn(move || {
+                for event in receiver {
+                    let _ = write_runtime_event(&directory, &event);
                 }
-                if let (Ok(mut file), Ok(line)) = (
-                    std::fs::OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open(&path),
-                    serde_json::to_string(&event),
-                ) {
-                    let _ = writeln!(file, "{line}");
-                }
-            }
-        });
+            });
+        }
     }
     app.state::<DesktopRuntime>().record("runtime-start", "");
     #[cfg(windows)]
@@ -195,9 +275,6 @@ pub fn session_changed(app: &tauri::AppHandle, interactive: bool, force: bool) {
         .unwrap()
         .session(interactive, runtime.now(), force);
     if changed {
-        // Suspension can stop both the Windows UI loop and this observer.
-        // Do not count locked/sleeping time as failure of the pending probe.
-        runtime.restart_pending_tick_grace(runtime.now());
         runtime.record(
             if interactive {
                 "session-interactive"
@@ -354,25 +431,20 @@ pub fn schedule_tick(app: &tauri::AppHandle) {
     // There can only be one queued main-thread probe even if its message loop
     // stalls. The independent Windows observer keeps handling lock/resume.
     if runtime.scheduled.swap(true, Ordering::SeqCst) {
-        if runtime.interactive() && runtime.queued_tick_stalled(runtime.now()) {
-            // Evidence only: a blocked UI loop cannot execute window repair.
-            // Leave its single queued probe intact; do not queue more UI work.
-            runtime.record("main-thread-probe-stalled", "");
-        }
         return;
     }
-    runtime
-        .scheduled_since
-        .store(runtime.now().max(1), Ordering::SeqCst);
     let handle = app.clone();
     if app
         .run_on_main_thread(move || {
             tick(&handle);
-            handle.state::<DesktopRuntime>().finish_tick();
+            handle
+                .state::<DesktopRuntime>()
+                .scheduled
+                .store(false, Ordering::SeqCst);
         })
         .is_err()
     {
-        runtime.finish_tick();
+        runtime.scheduled.store(false, Ordering::SeqCst);
     }
 }
 
@@ -517,8 +589,6 @@ fn finish_recreation(app: &tauri::AppHandle) {
                 .smoke_fail_creation
                 .swap(false, Ordering::SeqCst)
         {
-            app.state::<DesktopRuntime>()
-                .record("smoke-window-create-failed", &label);
             continue;
         }
         match tauri::WebviewWindowBuilder::from_config(app, config).and_then(|builder| {
@@ -635,7 +705,6 @@ pub fn handle_smoke_command(app: &tauri::AppHandle, arguments: &[String]) -> boo
         }
         "hang-mascot" => {
             if let Some(window) = app.get_webview_window("mascot") {
-                runtime.record("smoke-renderer-hang", "mascot");
                 let _ = window.eval("for (;;) {}");
             }
         }
@@ -705,6 +774,12 @@ pub fn desktop_runtime_smoke_receipt(
     let position = window.outer_position().ok();
     let size = window.outer_size().ok();
     let runtime = window.state::<DesktopRuntime>();
+    let paint_confirmation = runtime
+        .smoke_paint
+        .lock()
+        .ok()
+        .and_then(|confirmation| *confirmation)
+        .unwrap_or_default();
     let entry = {
         let h = runtime.health.lock().unwrap();
         let Some(view) = h.views.get(window.label()) else {
@@ -714,6 +789,8 @@ pub fn desktop_runtime_smoke_receipt(
             "sequence": sequence, "draftPresent": draft_present,
             "domPresent": dom_present, "cardPresent": card_present,
             "notificationVisible": notification_visible,
+            "paintConfirmationCount": paint_confirmation.count,
+            "paintConfirmationEpoch": paint_confirmation.epoch,
             "pointerCount": pointer_count,
             "processId": std::process::id(), "epoch": h.epoch,
             "interactive": h.interactive, "repairs": view.repairs,
@@ -746,41 +823,151 @@ mod tests {
     use super::*;
 
     #[test]
-    fn main_thread_stall_is_reported_once_per_pending_probe_and_resets_after_completion() {
+    fn notification_paint_evidence_is_not_collected_without_smoke_opt_in() {
         let runtime = DesktopRuntime::default();
-        runtime.scheduled.store(true, Ordering::SeqCst);
-        runtime.scheduled_since.store(1_000, Ordering::SeqCst);
-        assert!(!runtime.queued_tick_stalled(26_000));
-        assert!(runtime.queued_tick_stalled(26_001));
-        assert!(!runtime.queued_tick_stalled(90_000));
-        runtime.finish_tick();
-        assert!(!runtime.queued_tick_stalled(120_000));
-
-        runtime.scheduled.store(true, Ordering::SeqCst);
-        runtime.scheduled_since.store(120_000, Ordering::SeqCst);
-        assert!(runtime.queued_tick_stalled(145_001));
+        runtime.confirm_notification_paint(false);
+        assert_eq!(*runtime.smoke_paint.lock().unwrap(), None);
     }
 
     #[test]
-    fn main_thread_stall_ignores_unqueued_or_uninitialized_probe() {
+    fn smoke_notification_paint_count_survives_renderer_repair_and_tracks_current_epoch() {
         let runtime = DesktopRuntime::default();
-        assert!(!runtime.queued_tick_stalled(u64::MAX));
-        runtime.scheduled.store(true, Ordering::SeqCst);
-        assert!(!runtime.queued_tick_stalled(u64::MAX));
-        runtime.scheduled_since.store(500, Ordering::SeqCst);
-        assert!(!runtime.queued_tick_stalled(100));
+        runtime.confirm_notification_paint(true);
+        assert_eq!(
+            *runtime.smoke_paint.lock().unwrap(),
+            Some(SmokePaintConfirmation { count: 1, epoch: 1 })
+        );
+        runtime.health.lock().unwrap().epoch = 4;
+        runtime.confirm_notification_paint(true);
+        assert_eq!(
+            *runtime.smoke_paint.lock().unwrap(),
+            Some(SmokePaintConfirmation { count: 2, epoch: 4 })
+        );
     }
 
     #[test]
-    fn resumed_session_restarts_pending_probe_grace_without_queuing_more_work() {
+    fn runtime_log_accepts_only_enumerated_events_and_fixed_window_labels() {
         let runtime = DesktopRuntime::default();
-        runtime.scheduled.store(true, Ordering::SeqCst);
-        runtime.scheduled_since.store(1_000, Ordering::SeqCst);
-        assert!(runtime.queued_tick_stalled(26_001));
-        let resumed = 8 * 3_600_000;
-        runtime.restart_pending_tick_grace(resumed);
-        assert!(runtime.scheduled.load(Ordering::SeqCst));
-        assert!(!runtime.queued_tick_stalled(resumed + 25_000));
-        assert!(runtime.queued_tick_stalled(resumed + 25_001));
+        let (sender, receiver) = mpsc::sync_channel(4);
+        *runtime.log.lock().unwrap() = Some(sender);
+        runtime.record("arbitrary-user-text", "mascot");
+        runtime.record("renderer-reload", "arbitrary-user-label");
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        runtime.record("message-read-reconciled", "mascot");
+        let entry = receiver.try_recv().unwrap();
+        assert_eq!(entry.event, "message-read-reconciled");
+        assert_eq!(entry.window, "mascot");
+        let fields = serde_json::to_value(entry).unwrap();
+        assert_eq!(fields.as_object().unwrap().len(), 6);
+        assert!(fields["time_ms"].as_u64().unwrap() > 0);
+    }
+
+    struct LogTestDirectory(std::path::PathBuf);
+    impl LogTestDirectory {
+        fn new() -> Self {
+            let unique = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "huali-runtime-log-test-{}-{unique}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+        fn assert_bounded(&self) {
+            let mut total = 0;
+            for entry in std::fs::read_dir(&self.0).unwrap() {
+                let entry = entry.unwrap();
+                assert!(matches!(
+                    entry.file_name().to_str(),
+                    Some("runtime-health.jsonl" | "runtime-health.jsonl.1")
+                ));
+                let length = entry.metadata().unwrap().len();
+                assert!(length <= RUNTIME_LOG_FILE_LIMIT);
+                total += length;
+            }
+            assert!(total <= 131_072);
+        }
+    }
+    impl Drop for LogTestDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn event(sequence: u64) -> HealthEvent {
+        HealthEvent {
+            event: "renderer-reload",
+            window: "mascot-notification".into(),
+            epoch: sequence,
+            elapsed_ms: sequence,
+            time_ms: sequence,
+            process_id: std::process::id(),
+        }
+    }
+
+    #[test]
+    fn runtime_log_large_event_stream_never_exceeds_two_64kib_files() {
+        let directory = LogTestDirectory::new();
+        for sequence in 0..3_000 {
+            write_runtime_event(&directory.0, &event(sequence)).unwrap();
+            directory.assert_bounded();
+        }
+        assert!(directory.0.join("runtime-health.jsonl.1").exists());
+        for name in ["runtime-health.jsonl", "runtime-health.jsonl.1"] {
+            for line in std::fs::read_to_string(directory.0.join(name))
+                .unwrap()
+                .lines()
+            {
+                let entry: serde_json::Value = serde_json::from_str(line).unwrap();
+                assert_eq!(entry["event"], "renderer-reload");
+            }
+        }
+    }
+
+    #[test]
+    fn runtime_log_discards_oversized_existing_files_before_writing() {
+        let directory = LogTestDirectory::new();
+        std::fs::write(
+            directory.0.join("runtime-health.jsonl"),
+            vec![b'x'; RUNTIME_LOG_FILE_LIMIT as usize + 1],
+        )
+        .unwrap();
+        std::fs::write(
+            directory.0.join("runtime-health.jsonl.1"),
+            vec![b'x'; RUNTIME_LOG_FILE_LIMIT as usize * 4],
+        )
+        .unwrap();
+        trim_oversized_runtime_logs(&directory.0).unwrap();
+        directory.assert_bounded();
+        assert_eq!(std::fs::read_dir(&directory.0).unwrap().count(), 0);
+        write_runtime_event(&directory.0, &event(1)).unwrap();
+        directory.assert_bounded();
+    }
+
+    #[test]
+    fn runtime_log_drops_a_single_oversized_event_and_rotates_before_crossing_limit() {
+        let directory = LogTestDirectory::new();
+        let path = directory.0.join("runtime-health.jsonl");
+        std::fs::write(&path, vec![b'x'; RUNTIME_LOG_FILE_LIMIT as usize]).unwrap();
+        write_runtime_event(&directory.0, &event(1)).unwrap();
+        directory.assert_bounded();
+        assert_eq!(
+            std::fs::metadata(directory.0.join("runtime-health.jsonl.1"))
+                .unwrap()
+                .len(),
+            RUNTIME_LOG_FILE_LIMIT
+        );
+        let previous = std::fs::read(&path).unwrap();
+        let mut oversized = event(2);
+        oversized.window = "x".repeat(RUNTIME_LOG_FILE_LIMIT as usize);
+        write_runtime_event(&directory.0, &oversized).unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), previous);
+        directory.assert_bounded();
     }
 }

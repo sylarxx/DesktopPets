@@ -687,7 +687,8 @@ describe('notification and task production contracts', () => {
     const viewHandler = section(appSource, 'async function handleSysMessageView', 'function connectDesktopSockets')
 
     expectInOrder(markRead, 'const markedRead = await request.put', 'markedRead !== true', 'markedRead === false && await confirmMessagesAlreadyRead([message.id])', "throw new Error('服务端未确认消息已读')", 'message.msgStatus = 1')
-    expectInOrder(confirmation, 'pageNum <= READ_RECONCILIATION_MAX_PAGES', 'READ_RECONCILIATION_TIMEOUT_MS - (Date.now() - startedAt)', 'if (timeoutMs <= 0) break', "'/sys-message/page'", 'msgStatus: 1', 'if (Number(row.msgStatus) === 1) remainingIds.delete(id)', 'if (!remainingIds.size) return true', 'return false')
+    expectInOrder(confirmation, 'pageNum <= READ_RECONCILIATION_MAX_PAGES', 'READ_RECONCILIATION_TIMEOUT_MS - (Date.now() - startedAt)', 'if (timeoutMs <= 0) break', "'/sys-message/page'", 'msgStatus: 1', 'if (Number(row.msgStatus) === 1) remainingIds.delete(id)', 'if (!remainingIds.size) { confirmed = true; return true }', 'return false')
+    expect(confirmation).toContain("recordDesktopDiagnostic(confirmed ? 'message.read.reconciled' : 'message.read.unconfirmed')")
     expectInOrder(readHandler, 'await sysMessageService.markRead(message)', 'hideCurrentSysMessage(message)', 'catch (error)', 'sysMessageActionError.value = formatSysMessageActionError(error)')
     expectInOrder(viewHandler, 'const opened = await openSysMessageDetail(message)', 'if (!opened)', 'await sysMessageService.markRead(message)', 'catch (error)', 'return', 'hideCurrentSysMessage(message)')
   })

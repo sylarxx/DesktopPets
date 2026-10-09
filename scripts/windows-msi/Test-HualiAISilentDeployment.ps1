@@ -40,7 +40,7 @@ $MarkerPath = 'HKLM:\SOFTWARE\Huali\HualiAIDesktopAssistant'
 $RunPath = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run'
 $RunValueName = '华力AI桌面助手'
 $ProtocolSubKey = 'SOFTWARE\Classes\huali-ai-mascot'
-$LaunchLogPath = Join-Path $env:ProgramData 'HualiAI\Logs\launch-after-install.log'
+$LegacyLaunchLogPath = Join-Path $env:ProgramData 'HualiAI\Logs\launch-after-install.log'
 
 function Test-IsAdministrator {
   $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -169,14 +169,21 @@ function New-DesktopDiagnosticCleanupFixture {
   New-Item -ItemType Directory -Path $logDirectory -Force | Out-Null
   $primaryPath = Join-Path $logDirectory 'desktop-diagnostic.jsonl'
   $rotatedPath = Join-Path $logDirectory 'desktop-diagnostic.jsonl.1'
+  $runtimePath = Join-Path $logDirectory 'runtime-health.jsonl'
+  $runtimeRotatedPath = Join-Path $logDirectory 'runtime-health.jsonl.1'
   $retainedPath = Join-Path $logDirectory 'formal-release-retained-sentinel.txt'
   Set-Content -LiteralPath $primaryPath -Value 'legacy-primary' -Encoding UTF8
   Set-Content -LiteralPath $rotatedPath -Value 'legacy-rotated' -Encoding UTF8
   Set-Content -LiteralPath $retainedPath -Value 'retain' -Encoding UTF8
+  # An older build may have left files over the new strict 64KiB cap.
+  [IO.File]::WriteAllBytes($runtimePath, [byte[]]::new(131073))
+  [IO.File]::WriteAllBytes($runtimeRotatedPath, [byte[]]::new(131073))
   return [ordered]@{
     primaryPath = $primaryPath
     rotatedPath = $rotatedPath
     retainedPath = $retainedPath
+    runtimePath = $runtimePath
+    runtimeRotatedPath = $runtimeRotatedPath
   }
 }
 
@@ -192,6 +199,15 @@ function Assert-DesktopDiagnosticCleanup {
   if (-not (Test-Path -LiteralPath $Fixture.retainedPath -PathType Leaf)) {
     throw '诊断日志清理误删了非目标用户文件。'
   }
+  $runtimeBytes = 0L
+  foreach ($path in @($Fixture.runtimePath, $Fixture.runtimeRotatedPath)) {
+    if (Test-Path -LiteralPath $path -PathType Leaf) {
+      $length = (Get-Item -LiteralPath $path).Length
+      if ($length -gt 65536) { throw "运行日志超过64KiB上限：$path ($length bytes)" }
+      $runtimeBytes += $length
+    }
+  }
+  if ($runtimeBytes -gt 131072) { throw "运行日志总量超过128KiB：$runtimeBytes bytes" }
 }
 
 function Invoke-DesktopAuthProtocolCallbackSmoke {
@@ -649,38 +665,6 @@ function Wait-ForDefaultLaunch {
   throw '默认安装完成后，未在已登录交互用户会话找到主程序及可见窗口。'
 }
 
-function Get-LaunchLogLineCount {
-  if (-not (Test-Path -LiteralPath $LaunchLogPath -PathType Leaf)) {
-    return 0
-  }
-  return @(Get-Content -LiteralPath $LaunchLogPath -ErrorAction Stop).Count
-}
-
-function Wait-ForNewLaunchLogLine {
-  param(
-    [Parameter(Mandatory = $true)][int]$StartingLineCount,
-    [Parameter(Mandatory = $true)][string]$Pattern,
-    [int]$TimeoutSeconds = 20
-  )
-
-  $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
-  do {
-    if (Test-Path -LiteralPath $LaunchLogPath -PathType Leaf) {
-      $allLines = @(Get-Content -LiteralPath $LaunchLogPath -ErrorAction Stop)
-      if ($allLines.Count -gt $StartingLineCount) {
-        $newLines = @($allLines | Select-Object -Skip $StartingLineCount)
-        $match = $newLines | Where-Object { $_ -match $Pattern } | Select-Object -Last 1
-        if ($match) {
-          return [string]$match
-        }
-      }
-    }
-    Start-Sleep -Milliseconds 250
-  } while ([DateTime]::UtcNow -lt $deadline)
-
-  throw "安装后启动辅助程序未在新日志中写入预期状态：$Pattern"
-}
-
 function Wait-ForVisibleApplicationWindow {
   param(
     [Parameter(Mandatory = $true)][Diagnostics.Process]$Process,
@@ -951,6 +935,9 @@ try {
       rotatedRemoved = $true
       unrelatedFileRetained = $true
       newDiagnosticLogNotCreated = $true
+      oversizedRuntimeLogsCleaned = $true
+      runtimeLogMaximumFileBytes = 65536
+      runtimeLogMaximumTotalBytes = 131072
     }
   }
   Stop-HualiProcesses
@@ -978,7 +965,9 @@ try {
     }
 
     Write-Host '验证正式默认的安装后立即启动路径...'
-    $launchLogLineCount = Get-LaunchLogLineCount
+    $legacyLaunchLogDirectory = Split-Path -Parent $LegacyLaunchLogPath
+    New-Item -ItemType Directory -Path $legacyLaunchLogDirectory -Force | Out-Null
+    Set-Content -LiteralPath $LegacyLaunchLogPath -Value 'legacy launch helper log fixture' -Encoding UTF8
     Invoke-Install `
       -ResolvedMsi $resolvedMsi `
       -LogPath (Join-Path $resolvedEvidence '04-current-default-launch-install.log')
@@ -988,30 +977,22 @@ try {
       $launchedProcess = Wait-ForDefaultLaunch `
         -ExecutablePath $defaultLaunchState.ExecutablePath `
         -InteractiveSessions $interactiveSessions
-      $launchLogLine = Wait-ForNewLaunchLogLine `
-        -StartingLineCount $launchLogLineCount `
-        -Pattern 'STARTED account='
       $report.checks.defaultLaunch = [ordered]@{
         status = 'interactive-launch-verified'
         processId = $launchedProcess.Id
         sessionId = $launchedProcess.SessionId
         windowHandle = [HualiDeploymentSmokeNative]::FindVisibleApplicationWindow($launchedProcess.Id).ToInt64()
         executablePath = $defaultLaunchState.ExecutablePath
-        helperLogLine = $launchLogLine
         interactiveSessionVerified = $true
         hklmRunFallbackVerified = $true
         manualInteractiveGateRequired = $false
       }
       Stop-HualiProcesses
     } else {
-      $launchLogLine = Wait-ForNewLaunchLogLine `
-        -StartingLineCount $launchLogLineCount `
-        -Pattern 'SKIP no-interactive-user'
       Assert-NoHualiProcesses -Stage '无交互会话默认安装'
       $report.checks.defaultLaunch = [ordered]@{
         status = 'non-interactive-fallback-verified'
         executablePath = $defaultLaunchState.ExecutablePath
-        helperLogLine = $launchLogLine
         interactiveSessionVerified = $false
         helperNoInteractiveFallbackVerified = $true
         hklmRunFallbackVerified = $true
@@ -1022,7 +1003,18 @@ try {
       if ($RequireInteractiveDefaultLaunch) {
         throw '当前 Windows runner 没有 Explorer 交互桌面；默认启动的无用户回退路径已验证，但本次要求的交互真机门禁明确失败。'
       }
-      Write-Warning '当前 runner 无 Explorer：已验证辅助程序 SKIP 日志、不误启动进程与 HKLM Run 兜底；仍需在真实登录用户的 Windows 上执行交互默认启动门禁。'
+      Write-Warning '当前 runner 无 Explorer：已验证不误启动进程与 HKLM Run 兜底；仍需在真实登录用户的 Windows 上执行交互默认启动门禁。'
+    }
+    if (Test-Path -LiteralPath $LegacyLaunchLogPath -PathType Leaf) {
+      throw '安装后启动辅助程序未清理旧启动日志，或重新创建了启动日志。'
+    }
+    if (-not (Test-Path -LiteralPath $legacyLaunchLogDirectory -PathType Container)) {
+      throw '启动辅助程序删除了共享安装日志目录。'
+    }
+    $report.checks.launchHelperLogCleanup = [ordered]@{
+      legacyLaunchLogRemoved = $true
+      newLaunchLogNotCreated = $true
+      sharedLogDirectoryRetained = $true
     }
   } elseif ($RunVisualSmoke -or $RunRuntimeRecovery) {
     Invoke-Install `
@@ -1094,6 +1086,8 @@ try {
     foreach ($fixturePath in @(
       $diagnosticCleanupFixture.primaryPath,
       $diagnosticCleanupFixture.rotatedPath,
+      $diagnosticCleanupFixture.runtimePath,
+      $diagnosticCleanupFixture.runtimeRotatedPath,
       $diagnosticCleanupFixture.retainedPath
     )) {
       Remove-Item -LiteralPath $fixturePath -Force -ErrorAction SilentlyContinue
@@ -1124,9 +1118,6 @@ try {
     }
   }
 
-  if (Test-Path -LiteralPath $LaunchLogPath -PathType Leaf) {
-    Copy-Item -LiteralPath $LaunchLogPath -Destination (Join-Path $resolvedEvidence 'launch-after-install.log') -Force
-  }
   $report.completedAt = [DateTime]::UtcNow.ToString('o')
   $report | ConvertTo-Json -Depth 8 |
     Set-Content -LiteralPath (Join-Path $resolvedEvidence 'deployment-smoke-report.json') -Encoding UTF8

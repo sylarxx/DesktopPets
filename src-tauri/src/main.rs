@@ -680,7 +680,15 @@ fn cleanup_desktop_diagnostic_files(primary_path: &Path) -> DesktopDiagnosticCle
 }
 
 fn cleanup_desktop_diagnostic_logs(app: &tauri::AppHandle) -> DesktopDiagnosticCleanupResult {
-    cleanup_desktop_diagnostic_files(&desktop_diagnostic_log_path(app))
+    let result = cleanup_desktop_diagnostic_files(&desktop_diagnostic_log_path(app));
+    // The former diagnostic build could fall back to this fixed temporary
+    // directory. Remove only the same two legacy files there as well.
+    cleanup_desktop_diagnostic_files(
+        &std::env::temp_dir()
+            .join("huali-ai-desktop-logs")
+            .join(DESKTOP_DIAGNOSTIC_LOG_FILE),
+    );
+    result
 }
 
 fn write_desktop_diagnostic_event(
@@ -709,6 +717,34 @@ fn get_desktop_diagnostic_log_path(app: tauri::AppHandle) -> String {
     desktop_diagnostic_log_path(&app)
         .to_string_lossy()
         .into_owned()
+}
+
+#[tauri::command]
+fn record_desktop_runtime_event(window: tauri::WebviewWindow, event: String) -> bool {
+    // Renderer diagnostics accept only fixed outcomes, never arbitrary fields,
+    // message identities, error text, URLs or authentication values.
+    if window.label() != "mascot" {
+        return false;
+    }
+    let event = match event.as_str() {
+        "notification-layout-unconfirmed" => "notification-layout-unconfirmed",
+        "notification-show-unconfirmed" => "notification-show-unconfirmed",
+        "notification-paint-unconfirmed" => "notification-paint-unconfirmed",
+        "notification-delivery-stopped" => "notification-delivery-stopped",
+        "message-read-reconciled" => "message-read-reconciled",
+        "message-read-unconfirmed" => "message-read-unconfirmed",
+        "message-read-unauthorized" => "message-read-unauthorized",
+        "message-read-forbidden" => "message-read-forbidden",
+        "message-read-timeout" => "message-read-timeout",
+        "message-read-failed" => "message-read-failed",
+        "reminder-poll-failed" => "reminder-poll-failed",
+        "reminder-websocket-failed" => "reminder-websocket-failed",
+        _ => return false,
+    };
+    window
+        .state::<runtime_recovery::DesktopRuntime>()
+        .record(event, window.label());
+    true
 }
 
 fn valid_release_smoke_value(value: &str) -> bool {
@@ -4329,14 +4365,11 @@ fn ack_mascot_system_notification_visible(
     }
     let emitted =
         emit_mascot_system_notification_visibility(window.app_handle(), client_generation, true);
-    runtime.record(
-        if emitted {
-            "notification-visible-confirmed"
-        } else {
-            "notification-visible-receipt-failed"
-        },
-        window.label(),
-    );
+    if emitted {
+        runtime.confirm_notification_paint_for_smoke();
+    } else {
+        runtime.record("notification-visible-receipt-failed", window.label());
+    }
     emitted
 }
 
@@ -4349,6 +4382,23 @@ fn show_mascot_system_notification_window(
 ) -> bool {
     let compact = compact.unwrap_or(false);
     let record_result = |success: bool, reason: &str| {
+        if !success {
+            let event = match reason {
+                "not-ready-or-stale" => "notification-not-ready-or-stale",
+                "state-unavailable" => "notification-state-unavailable",
+                "transition-unavailable" => "notification-transition-unavailable",
+                "superseded-before-window"
+                | "superseded-after-position"
+                | "superseded-after-show" => "notification-superseded",
+                "mascot-window-unavailable" => "notification-mascot-unavailable",
+                "mascot-window-hidden" => "notification-mascot-hidden",
+                "notification-window-unavailable" => "notification-window-unavailable",
+                "position-failed" => "notification-position-failed",
+                _ => "notification-native-show-failed",
+            };
+            app.state::<runtime_recovery::DesktopRuntime>()
+                .record(event, "mascot-notification");
+        }
         write_desktop_diagnostic_event(
             &app,
             "notification.native_window_show",
@@ -5455,6 +5505,7 @@ fn main() {
             exit_app,
             open_or_focus_web_url,
             record_desktop_diagnostic_event,
+            record_desktop_runtime_event,
             get_desktop_diagnostic_log_path,
             record_desktop_auth_renderer_receipt,
             take_desktop_auth_callback,

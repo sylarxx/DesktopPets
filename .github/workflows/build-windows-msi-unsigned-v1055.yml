@@ -47,6 +47,7 @@ jobs:
             '.\scripts\windows-msi\Test-HualiAIMessageDrag.ps1',
             '.\scripts\windows-msi\Test-HualiAIMsi.ps1',
             '.\scripts\windows-msi\Test-HualiAISilentDeployment.ps1'
+            '.\src-tauri\windows\launch-after-install.ps1'
           )) {
             [scriptblock]::Create((Get-Content -LiteralPath $gate -Raw)) | Out-Null
           }
@@ -60,6 +61,7 @@ jobs:
             '.\scripts\windows-msi\Test-HualiAIMessageDrag.ps1',
             '.\scripts\windows-msi\Test-HualiAIMsi.ps1',
             '.\scripts\windows-msi\Test-HualiAISilentDeployment.ps1'
+            '.\src-tauri\windows\launch-after-install.ps1'
           )) {
             [scriptblock]::Create((Get-Content -LiteralPath $gate -Raw)) | Out-Null
           }
@@ -90,6 +92,7 @@ jobs:
           src/services/sys-message.service.test.ts
           src/services/window.service.test.ts
           src/services/desktop-auth.service.test.ts
+          src/services/diagnostic.service.test.ts
           src/services/session.service.test.ts
           src/services/session-recovery.service.test.ts
           src/stores/task.test.ts
@@ -210,6 +213,7 @@ jobs:
         run: |
           $package = '.\artifacts\windows-msi-intranet'
           Copy-Item '.\docs\releases\v1.0.55.md' (Join-Path $package 'RELEASE-NOTES.md')
+          Copy-Item '.\docs\releases\runtime-diagnostics.md' (Join-Path $package 'RUNTIME-DIAGNOSTICS.md')
           Copy-Item '.\artifacts\runtime-recovery-qa\source-regression.json' '.\artifacts\windows-deployment-smoke\source-regression.json'
           Copy-Item '.\artifacts\message-action-qa\report.json' '.\artifacts\windows-deployment-smoke\message-action-source.json'
           Copy-Item '.\artifacts\message-read-conflict-qa\report.json' '.\artifacts\windows-deployment-smoke\message-read-conflict.json'
