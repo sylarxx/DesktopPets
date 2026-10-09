@@ -11,6 +11,7 @@ use std::time::Instant;
 use tauri::{Emitter, Manager, PhysicalPosition, PhysicalSize, Position, Size};
 
 const RUNTIME_LOG_FILE_LIMIT: u64 = 64 * 1024;
+const MAIN_THREAD_STALL_TIMEOUT_MS: u64 = 25_000;
 
 #[derive(Serialize)]
 struct HealthEvent {
@@ -97,6 +98,8 @@ pub struct DesktopRuntime {
     windows: Mutex<BTreeMap<String, RecoveryWindow>>,
     started: Instant,
     scheduled: AtomicBool,
+    scheduled_since: AtomicU64,
+    stall_reported: AtomicBool,
     smoke_session: AtomicI8,
     smoke_fail_creation: AtomicBool,
     last_resync: AtomicU64,
@@ -111,6 +114,8 @@ impl Default for DesktopRuntime {
             windows: Mutex::new(BTreeMap::new()),
             started: Instant::now(),
             scheduled: AtomicBool::new(false),
+            scheduled_since: AtomicU64::new(0),
+            stall_reported: AtomicBool::new(false),
             smoke_session: AtomicI8::new(-1),
             smoke_fail_creation: AtomicBool::new(false),
             last_resync: AtomicU64::new(0),
@@ -126,6 +131,24 @@ impl DesktopRuntime {
     }
     pub fn interactive(&self) -> bool {
         self.health.lock().map(|h| h.interactive).unwrap_or(false)
+    }
+
+    fn claim_resync(&self, now: u64) -> bool {
+        let mut last = self.last_resync.load(Ordering::SeqCst);
+        loop {
+            if last != 0 && now.saturating_sub(last) < 15_000 {
+                return false;
+            }
+            match self.last_resync.compare_exchange(
+                last,
+                now.max(1),
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => return true,
+                Err(current) => last = current,
+            }
+        }
     }
 
     pub fn record(&self, event: &'static str, label: &str) {
@@ -146,6 +169,7 @@ impl DesktopRuntime {
                 | "window-create-failed"
                 | "renderer-mounted-after-repair"
                 | "notification-visible-rejected"
+                | "notification-visible-confirmed"
                 | "notification-visible-receipt-failed"
                 | "session-observer-create-failed"
                 | "session-registration-failed"
@@ -171,6 +195,7 @@ impl DesktopRuntime {
                 | "notification-window-unavailable"
                 | "notification-position-failed"
                 | "notification-native-show-failed"
+                | "main-thread-probe-stalled"
         ) || (!label.is_empty() && !LABELS.contains(&label))
         {
             return;
@@ -241,6 +266,27 @@ impl DesktopRuntime {
             .map(|windows| windows.values().any(|s| s.recreate))
             .unwrap_or(false)
     }
+
+    fn queued_tick_stalled(&self, now: u64) -> bool {
+        let since = self.scheduled_since.load(Ordering::SeqCst);
+        self.scheduled.load(Ordering::SeqCst)
+            && since != 0
+            && now.saturating_sub(since) > MAIN_THREAD_STALL_TIMEOUT_MS
+            && !self.stall_reported.swap(true, Ordering::SeqCst)
+    }
+
+    fn finish_tick(&self) {
+        self.scheduled_since.store(0, Ordering::SeqCst);
+        self.stall_reported.store(false, Ordering::SeqCst);
+        self.scheduled.store(false, Ordering::SeqCst);
+    }
+
+    fn restart_pending_tick_grace(&self, now: u64) {
+        if self.scheduled.load(Ordering::SeqCst) {
+            self.scheduled_since.store(now.max(1), Ordering::SeqCst);
+            self.stall_reported.store(false, Ordering::SeqCst);
+        }
+    }
 }
 
 pub fn initialize(app: &tauri::AppHandle) {
@@ -275,6 +321,9 @@ pub fn session_changed(app: &tauri::AppHandle, interactive: bool, force: bool) {
         .unwrap()
         .session(interactive, runtime.now(), force);
     if changed {
+        // Sleep can suspend both UI and observer threads. Start a new grace
+        // period for the same pending probe instead of counting suspended time.
+        runtime.restart_pending_tick_grace(runtime.now());
         runtime.record(
             if interactive {
                 "session-interactive"
@@ -382,13 +431,7 @@ pub fn request_runtime_resync(window: tauri::WebviewWindow) {
         return;
     }
     let now = runtime.now();
-    if runtime
-        .last_resync
-        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |last| {
-            (last == 0 || now.saturating_sub(last) >= 15_000).then_some(now.max(1))
-        })
-        .is_ok()
-    {
+    if runtime.claim_resync(now) {
         session_changed(app, true, true);
     }
 }
@@ -431,20 +474,25 @@ pub fn schedule_tick(app: &tauri::AppHandle) {
     // There can only be one queued main-thread probe even if its message loop
     // stalls. The independent Windows observer keeps handling lock/resume.
     if runtime.scheduled.swap(true, Ordering::SeqCst) {
+        if runtime.interactive() && runtime.queued_tick_stalled(runtime.now()) {
+            // Log this pending probe once. A blocked UI loop cannot execute
+            // repair, and queuing another UI task would only add to the stall.
+            runtime.record("main-thread-probe-stalled", "");
+        }
         return;
     }
+    runtime
+        .scheduled_since
+        .store(runtime.now().max(1), Ordering::SeqCst);
     let handle = app.clone();
     if app
         .run_on_main_thread(move || {
             tick(&handle);
-            handle
-                .state::<DesktopRuntime>()
-                .scheduled
-                .store(false, Ordering::SeqCst);
+            handle.state::<DesktopRuntime>().finish_tick();
         })
         .is_err()
     {
-        runtime.scheduled.store(false, Ordering::SeqCst);
+        runtime.finish_tick();
     }
 }
 
@@ -821,6 +869,57 @@ pub fn desktop_runtime_smoke_receipt(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn main_thread_stall_is_reported_once_per_pending_probe_and_resets_after_completion() {
+        let runtime = DesktopRuntime::default();
+        runtime.scheduled.store(true, Ordering::SeqCst);
+        runtime.scheduled_since.store(1_000, Ordering::SeqCst);
+        assert!(!runtime.queued_tick_stalled(26_000));
+        assert!(runtime.queued_tick_stalled(26_001));
+        assert!(!runtime.queued_tick_stalled(90_000));
+        runtime.finish_tick();
+        assert!(!runtime.queued_tick_stalled(120_000));
+
+        runtime.scheduled.store(true, Ordering::SeqCst);
+        runtime.scheduled_since.store(120_000, Ordering::SeqCst);
+        assert!(runtime.queued_tick_stalled(145_001));
+    }
+
+    #[test]
+    fn main_thread_stall_ignores_unqueued_or_uninitialized_probe() {
+        let runtime = DesktopRuntime::default();
+        assert!(!runtime.queued_tick_stalled(u64::MAX));
+        runtime.scheduled.store(true, Ordering::SeqCst);
+        assert!(!runtime.queued_tick_stalled(u64::MAX));
+        runtime.scheduled_since.store(500, Ordering::SeqCst);
+        assert!(!runtime.queued_tick_stalled(100));
+    }
+
+    #[test]
+    fn resumed_session_restarts_pending_probe_grace_without_queuing_more_work() {
+        let runtime = DesktopRuntime::default();
+        runtime.scheduled.store(true, Ordering::SeqCst);
+        runtime.scheduled_since.store(1_000, Ordering::SeqCst);
+        assert!(runtime.queued_tick_stalled(26_001));
+        let resumed = 8 * 3_600_000;
+        runtime.restart_pending_tick_grace(resumed);
+        assert!(runtime.scheduled.load(Ordering::SeqCst));
+        assert!(!runtime.queued_tick_stalled(resumed + 25_000));
+        assert!(runtime.queued_tick_stalled(resumed + 25_001));
+    }
+
+    #[test]
+    fn runtime_resync_claim_preserves_first_call_interval_and_clock_rollback_guard() {
+        let runtime = DesktopRuntime::default();
+        assert!(runtime.claim_resync(0));
+        assert!(!runtime.claim_resync(0));
+        assert!(!runtime.claim_resync(15_000));
+        assert!(runtime.claim_resync(15_001));
+        assert!(!runtime.claim_resync(10_000));
+        assert!(!runtime.claim_resync(30_000));
+        assert!(runtime.claim_resync(30_001));
+    }
 
     #[test]
     fn notification_paint_evidence_is_not_collected_without_smoke_opt_in() {

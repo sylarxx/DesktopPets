@@ -13,6 +13,8 @@
 | `notification-window-unavailable` / `notification-mascot-unavailable` | 对应原生窗口不存在 |
 | `notification-position-failed` / `notification-native-show-failed` | 原生定位或显示失败 |
 | `notification-visible-rejected` | 帧回执不符合当前批次、会话或真实窗口可见状态 |
+| `notification-visible-confirmed` | 当前批次的显示后帧及原生可见性确认成功；只在实际显示确认时记录，不逐帧或随正文刷新记录 |
+| `main-thread-probe-stalled` | 单个已投递 UI 探针超过 25 秒未执行；仅记一次，锁屏/休眠及其恢复宽限不计为故障 |
 | `message-read-reconciled` | 写接口返回 false，但已明确回读确认同一消息已读 |
 | `message-read-unconfirmed` | 写接口返回 false，限定范围内未确认同一消息已读 |
 | `message-read-unauthorized` / `message-read-forbidden` | 已读操作遇到登录失效或权限不足 |

@@ -4367,6 +4367,10 @@ fn ack_mascot_system_notification_visible(
         emit_mascot_system_notification_visibility(window.app_handle(), client_generation, true);
     if emitted {
         runtime.confirm_notification_paint_for_smoke();
+        // One receipt per actual post-show presentation, never per frame or
+        // ordinary content refresh. It distinguishes a successful renderer
+        // receipt from a later GPU/display symptom in a field investigation.
+        runtime.record("notification-visible-confirmed", window.label());
     } else {
         runtime.record("notification-visible-receipt-failed", window.label());
     }
