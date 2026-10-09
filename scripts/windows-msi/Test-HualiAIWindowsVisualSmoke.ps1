@@ -546,6 +546,49 @@ function Wait-ForWindows {
   throw "等待 Windows 界面状态超时（$TimeoutSeconds 秒）。"
 }
 
+function Save-VisualRuntimeSnapshot {
+  param([Parameter(Mandatory = $true)][string]$Stage)
+
+  # Collect an existing nonce-gated receipt after an assertion, without retrying
+  # input or changing the condition under test. No user profile is inspected.
+  $script:visualReceiptSequence++
+  $sequence = $script:visualReceiptSequence
+  $trigger = Start-Process -FilePath $resolvedExecutable `
+    -ArgumentList "--huali-runtime-smoke=snapshot-$sequence" -PassThru
+  if (-not $trigger.WaitForExit(5000)) {
+    Stop-Process -Id $trigger.Id -Force -ErrorAction SilentlyContinue
+    throw 'Visual diagnostic snapshot command timed out.'
+  }
+  $deadline = [DateTime]::UtcNow.AddSeconds(5)
+  $lastSnapshot = $null
+  $missingLabels = @('mascot', 'panel', 'mascot-menu', 'mascot-notification')
+  do {
+    try {
+      $snapshot = Get-Content -LiteralPath $script:visualReceiptPath -Raw | ConvertFrom-Json
+      $mascotEntry = $snapshot.PSObject.Properties['mascot']
+      if ($null -ne $mascotEntry -and $mascotEntry.Value.sequence -eq $sequence -and
+          $mascotEntry.Value.processId -eq $process.Id) {
+        $lastSnapshot = $snapshot
+        $missingLabels = @(@('mascot', 'panel', 'mascot-menu', 'mascot-notification') | Where-Object {
+          $entry = $snapshot.PSObject.Properties[$_]
+          $null -eq $entry -or $entry.Value.sequence -ne $sequence -or $entry.Value.processId -ne $process.Id
+        })
+        if ($missingLabels.Count -eq 0) { break }
+      }
+    } catch {}
+    Start-Sleep -Milliseconds 100
+  } while ([DateTime]::UtcNow -lt $deadline)
+  if ($null -eq $lastSnapshot) { throw 'Visual diagnostic renderer receipt timed out.' }
+  $lastSnapshot | Add-Member -NotePropertyName receiptEvidence -NotePropertyValue ([ordered]@{
+    sequence = $sequence
+    missingFreshLabels = $missingLabels
+  }) -Force
+  # Save the parsed object, not a second read of the concurrently written file.
+  $lastSnapshot | ConvertTo-Json -Depth 12 | Set-Content `
+    -LiteralPath (Join-Path $resolvedOutput "$Stage-runtime-receipt.json") -Encoding UTF8
+  return $lastSnapshot
+}
+
 function Find-WindowByHandle {
   param(
     [Parameter(Mandatory = $true)]$Windows,
@@ -1154,6 +1197,9 @@ $backdrop = $null
 $visualSmokeDataDirectory = $null
 $visualFailure = $null
 $cleanupFailure = $null
+$script:visualReceiptSequence = 0
+$visualNonce = [Guid]::NewGuid().ToString('N')
+$script:visualReceiptPath = Join-Path ([IO.Path]::GetTempPath()) "huali-runtime-smoke-$visualNonce.json"
 
 try {
   $virtualScreen = [Windows.Forms.SystemInformation]::VirtualScreen
@@ -1194,6 +1240,13 @@ try {
     '1',
     [EnvironmentVariableTarget]::Process
   )
+  $previousVisualReleaseEnvironment = @{}
+  foreach ($key in @('HUALI_AI_RELEASE_SMOKE', 'HUALI_AI_RELEASE_SMOKE_NONCE', 'HUALI_AI_RELEASE_SMOKE_AUTH_STATE')) {
+    $previousVisualReleaseEnvironment[$key] = [Environment]::GetEnvironmentVariable($key, 'Process')
+  }
+  [Environment]::SetEnvironmentVariable('HUALI_AI_RELEASE_SMOKE', '1', 'Process')
+  [Environment]::SetEnvironmentVariable('HUALI_AI_RELEASE_SMOKE_NONCE', $visualNonce, 'Process')
+  [Environment]::SetEnvironmentVariable('HUALI_AI_RELEASE_SMOKE_AUTH_STATE', $visualNonce, 'Process')
   try {
     $process = Start-Process -FilePath $resolvedExecutable -PassThru
     $visualSmokeDataDirectory = Join-Path `
@@ -1206,6 +1259,9 @@ try {
       $previousVisualSmokeMotion,
       [EnvironmentVariableTarget]::Process
     )
+    foreach ($key in $previousVisualReleaseEnvironment.Keys) {
+      [Environment]::SetEnvironmentVariable($key, $previousVisualReleaseEnvironment[$key], 'Process')
+    }
   }
   $startupWindows = Wait-ForWindows -Process $process -Condition {
     param($windows)
@@ -1500,6 +1556,7 @@ try {
     visual = $menuAboveVisual
   }
   Save-ScreenCapture -FileName '03-context-menu-above-full-screen.png' | Out-Null
+  $report.checks.firstContextMenuRuntime = Save-VisualRuntimeSnapshot -Stage '03-first-context-menu'
 
   $dismissWorkArea = Get-MonitorWorkArea -WindowHandle $mascotHandle
   Invoke-MouseClick `
@@ -1823,6 +1880,14 @@ try {
     # The primary assertion remains authoritative if screen capture itself is
     # unavailable (for example after an interactive desktop disconnect).
   }
+  try {
+    if ($process -and -not $process.HasExited) {
+      $report.checks.failureWindows = @(Get-WindowSnapshot -Process $process)
+      $report.checks.failureRuntime = Save-VisualRuntimeSnapshot -Stage '99-failure'
+    }
+  } catch {
+    $report.checks.failureReceiptUnavailable = $_.Exception.Message
+  }
 } finally {
   try {
     if ($process -and -not $process.HasExited) {
@@ -1868,6 +1933,17 @@ try {
       if (-not $report.failure) {
         $report.failure = $_.Exception.Message
       }
+    }
+  }
+  foreach ($receiptFile in @($script:visualReceiptPath, (Join-Path ([IO.Path]::GetTempPath()) "huali-ai-desktop-auth-smoke-$visualNonce.json"))) {
+    try {
+      if (Test-Path -LiteralPath $receiptFile) {
+        Remove-Item -LiteralPath $receiptFile -Force
+      }
+    } catch {
+      if (-not $cleanupFailure) { $cleanupFailure = $_ }
+      $report.ok = $false
+      if (-not $report.failure) { $report.failure = $_.Exception.Message }
     }
   }
   $report.completedAt = [DateTime]::UtcNow.ToString('o')

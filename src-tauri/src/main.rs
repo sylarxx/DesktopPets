@@ -7,6 +7,7 @@ mod runtime_recovery;
 #[cfg(windows)]
 mod windows_session;
 
+use runtime_recovery::ContextMenuSmokePhase;
 use std::collections::VecDeque;
 use std::fs;
 #[cfg(windows)]
@@ -363,7 +364,8 @@ fn restore_staged_mascot_position(app: &tauri::AppHandle, window: &tauri::Webvie
     let _ = (app, window);
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 struct MascotContextMenuStatus {
     ready: bool,
     desired_visible: bool,
@@ -502,6 +504,13 @@ impl MascotContextMenuState {
             .lock()
             .map(|status| status.visible)
             .unwrap_or(false)
+    }
+
+    fn current_generation(&self) -> u64 {
+        self.status
+            .lock()
+            .map(|status| status.generation)
+            .unwrap_or(0)
     }
 
     #[cfg(test)]
@@ -3863,6 +3872,15 @@ fn hide_mascot_context_menu_native_window(app: &tauri::AppHandle) {
     }
 }
 
+fn trace_context_menu_for_smoke(
+    app: &tauri::AppHandle,
+    phase: ContextMenuSmokePhase,
+    generation: u64,
+) {
+    app.state::<runtime_recovery::DesktopRuntime>()
+        .trace_context_menu_for_smoke(phase, generation);
+}
+
 // The caller holds `state.transition`. Only cancel the supplied generation so
 // a stale placement, ACK or timeout can never hide a newer menu request.
 fn rollback_mascot_context_menu_generation(
@@ -3872,6 +3890,7 @@ fn rollback_mascot_context_menu_generation(
 ) -> bool {
     let cancelled = state.cancel_generation(generation);
     if cancelled {
+        trace_context_menu_for_smoke(app, ContextMenuSmokePhase::Rollback, generation);
         hide_mascot_context_menu_native_window(app);
     }
     if cancelled {
@@ -3890,7 +3909,9 @@ fn hide_mascot_context_menu_window_with_restore(
         let _ = emit_mascot_context_menu_visibility(app, false, restore_notification);
         return;
     };
-    let _ = state.request_hide();
+    if let Ok(generation) = state.request_hide() {
+        trace_context_menu_for_smoke(app, ContextMenuSmokePhase::HideRequest, generation);
+    }
     // On Windows the transparent menu HWND is shown off-screen briefly so its
     // WebView2 renderer can mount and publish ready. Hiding it before that IPC
     // arrives suspends navigation and makes the first real right-click wait
@@ -3982,6 +4003,7 @@ fn prepare_mascot_context_menu_generation(
         geometry.payload,
     )
     .map_err(|error| format!("failed to publish mascot context menu placement: {error}"))?;
+    trace_context_menu_for_smoke(app, ContextMenuSmokePhase::PlacementPublished, generation);
     Ok(true)
 }
 
@@ -4000,6 +4022,7 @@ fn schedule_mascot_context_menu_timeout(
             return;
         };
         if state.expire_pending_show(generation) {
+            trace_context_menu_for_smoke(&app, ContextMenuSmokePhase::Timeout, generation);
             hide_mascot_context_menu_native_window(&app);
             let _ = emit_mascot_context_menu_visibility(&app, false, true);
         }
@@ -4018,6 +4041,7 @@ fn show_mascot_context_menu(
         .lock()
         .map_err(|_| "mascot context menu transition is unavailable".to_string())?;
     let generation = state.request_show()?;
+    trace_context_menu_for_smoke(&app, ContextMenuSmokePhase::ShowRequest, generation);
     if state.can_prepare(generation) {
         hide_mascot_context_menu_native_window(&app);
         match prepare_mascot_context_menu_generation(&app, state.inner(), generation) {
@@ -4037,6 +4061,7 @@ fn show_mascot_context_menu(
     }
     // The Windows warm-up WebView will prepare this generation from its ready
     // command. Do not start the layout timeout until placement was emitted.
+    trace_context_menu_for_smoke(&app, ContextMenuSmokePhase::AwaitReady, generation);
     Ok(true)
 }
 
@@ -4046,45 +4071,56 @@ fn ack_mascot_context_menu_layout(
     state: tauri::State<'_, MascotContextMenuState>,
     generation: u64,
 ) -> Result<bool, String> {
-    let _transition = state
-        .transition
-        .lock()
-        .map_err(|_| "mascot context menu transition is unavailable".to_string())?;
+    let rejected = || {
+        trace_context_menu_for_smoke(&app, ContextMenuSmokePhase::AckRejected, generation);
+    };
+    let _transition = state.transition.lock().map_err(|_| {
+        rejected();
+        "mascot context menu transition is unavailable".to_string()
+    })?;
     if !state.can_ack_layout(generation) {
+        rejected();
         return Ok(false);
     }
     let menu = match app.get_webview_window("mascot-menu") {
         Some(menu) => menu,
         None => {
+            rejected();
             rollback_mascot_context_menu_generation(&app, state.inner(), generation);
             return Err("mascot context menu window is unavailable".to_string());
         }
     };
     harden_transparent_window(&menu);
     if let Err(error) = menu.show() {
+        rejected();
         rollback_mascot_context_menu_generation(&app, state.inner(), generation);
         return Err(format!("failed to show mascot context menu: {error}"));
     }
     if let Err(error) = menu.set_ignore_cursor_events(false) {
+        rejected();
         rollback_mascot_context_menu_generation(&app, state.inner(), generation);
         return Err(format!(
             "failed to restore mascot context menu hit testing: {error}"
         ));
     }
     if let Err(error) = menu.set_focus() {
+        rejected();
         rollback_mascot_context_menu_generation(&app, state.inner(), generation);
         return Err(format!("failed to focus mascot context menu: {error}"));
     }
     if !state.mark_visible(generation) {
         // This is not expected while the transition lock is held. Generation-
         // scoped rollback avoids hiding a newer menu if the ACK became stale.
+        rejected();
         rollback_mascot_context_menu_generation(&app, state.inner(), generation);
         return Ok(false);
     }
     if let Err(error) = emit_mascot_context_menu_visibility(&app, true, true) {
+        rejected();
         rollback_mascot_context_menu_generation(&app, state.inner(), generation);
         return Err(error);
     }
+    trace_context_menu_for_smoke(&app, ContextMenuSmokePhase::AckAccepted, generation);
     Ok(true)
 }
 
@@ -4103,7 +4139,13 @@ fn set_mascot_context_menu_ready(
         .transition
         .lock()
         .map_err(|_| "mascot context menu transition is unavailable".to_string())?;
-    let Some(generation) = state.mark_ready()? else {
+    let pending_generation = state.mark_ready()?;
+    trace_context_menu_for_smoke(
+        &app,
+        ContextMenuSmokePhase::Ready,
+        pending_generation.unwrap_or_else(|| state.current_generation()),
+    );
+    let Some(generation) = pending_generation else {
         if let Some(menu) = app.get_webview_window("mascot-menu") {
             menu.set_ignore_cursor_events(true)
                 .map_err(|error| format!("failed to finish menu warm-up hit testing: {error}"))?;
@@ -4173,6 +4215,11 @@ fn hide_context_menu_after_focus_moves_outside_app(app: tauri::AppHandle) {
         }
 
         if app.state::<MascotContextMenuState>().is_visible() {
+            trace_context_menu_for_smoke(
+                &app,
+                ContextMenuSmokePhase::FocusDismiss,
+                app.state::<MascotContextMenuState>().current_generation(),
+            );
             hide_mascot_context_menu_window(&app);
         }
     });

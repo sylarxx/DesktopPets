@@ -1,6 +1,6 @@
 use crate::runtime_health::{Repair, RuntimeHealth, LABELS};
 use serde::Serialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::io::Write;
 use std::path::Path;
 use std::sync::{
@@ -12,6 +12,7 @@ use tauri::{Emitter, Manager, PhysicalPosition, PhysicalSize, Position, Size};
 
 const RUNTIME_LOG_FILE_LIMIT: u64 = 64 * 1024;
 const MAIN_THREAD_STALL_TIMEOUT_MS: u64 = 25_000;
+const CONTEXT_MENU_SMOKE_TRACE_LIMIT: usize = 16;
 
 #[derive(Serialize)]
 struct HealthEvent {
@@ -93,6 +94,29 @@ struct SmokePaintConfirmation {
     epoch: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ContextMenuSmokePhase {
+    ShowRequest,
+    HideRequest,
+    AwaitReady,
+    Ready,
+    PlacementPublished,
+    AckAccepted,
+    AckRejected,
+    Timeout,
+    Rollback,
+    FocusDismiss,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ContextMenuSmokeEvent {
+    phase: ContextMenuSmokePhase,
+    generation: u64,
+    elapsed_ms: u64,
+}
+
 pub struct DesktopRuntime {
     health: Mutex<RuntimeHealth>,
     windows: Mutex<BTreeMap<String, RecoveryWindow>>,
@@ -104,6 +128,7 @@ pub struct DesktopRuntime {
     smoke_fail_creation: AtomicBool,
     last_resync: AtomicU64,
     smoke_paint: Mutex<Option<SmokePaintConfirmation>>,
+    smoke_context_menu: Mutex<Option<VecDeque<ContextMenuSmokeEvent>>>,
     log: Mutex<Option<mpsc::SyncSender<HealthEvent>>>,
 }
 
@@ -120,6 +145,7 @@ impl Default for DesktopRuntime {
             smoke_fail_creation: AtomicBool::new(false),
             last_resync: AtomicU64::new(0),
             smoke_paint: Mutex::new(None),
+            smoke_context_menu: Mutex::new(None),
             log: Mutex::new(None),
         }
     }
@@ -249,6 +275,27 @@ impl DesktopRuntime {
             let confirmation = confirmation.get_or_insert_with(SmokePaintConfirmation::default);
             confirmation.count = confirmation.count.saturating_add(1);
             confirmation.epoch = epoch;
+        }
+    }
+
+    pub fn trace_context_menu_for_smoke(&self, phase: ContextMenuSmokePhase, generation: u64) {
+        self.trace_context_menu(smoke_enabled(), phase, generation);
+    }
+
+    fn trace_context_menu(&self, enabled: bool, phase: ContextMenuSmokePhase, generation: u64) {
+        if !enabled {
+            return;
+        }
+        if let Ok(mut trace) = self.smoke_context_menu.lock() {
+            let trace = trace.get_or_insert_with(VecDeque::new);
+            if trace.len() == CONTEXT_MENU_SMOKE_TRACE_LIMIT {
+                trace.pop_front();
+            }
+            trace.push_back(ContextMenuSmokeEvent {
+                phase,
+                generation,
+                elapsed_ms: self.now(),
+            });
         }
     }
 
@@ -828,7 +875,7 @@ pub fn desktop_runtime_smoke_receipt(
         .ok()
         .and_then(|confirmation| *confirmation)
         .unwrap_or_default();
-    let entry = {
+    let mut entry = {
         let h = runtime.health.lock().unwrap();
         let Some(view) = h.views.get(window.label()) else {
             return false;
@@ -849,6 +896,27 @@ pub fn desktop_runtime_smoke_receipt(
             "position": position, "size": size,
         })
     };
+    if window.label() == "mascot" {
+        // This receipt is already gated by the CI nonce. Copy short-lived state
+        // locks independently and keep menu evidence in memory until requested.
+        let status = window
+            .state::<crate::MascotContextMenuState>()
+            .status
+            .lock()
+            .ok()
+            .map(|status| *status);
+        let mut context_menu = status
+            .and_then(|status| serde_json::to_value(status).ok())
+            .unwrap_or_else(|| serde_json::json!({ "stateUnavailable": true }));
+        let trace = runtime
+            .smoke_context_menu
+            .lock()
+            .ok()
+            .and_then(|trace| trace.clone())
+            .unwrap_or_default();
+        context_menu["trace"] = serde_json::to_value(trace).unwrap_or_default();
+        entry["contextMenu"] = context_menu;
+    }
     static RECEIPT_LOCK: Mutex<()> = Mutex::new(());
     let Ok(_guard) = RECEIPT_LOCK.lock() else {
         return false;
@@ -926,6 +994,31 @@ mod tests {
         let runtime = DesktopRuntime::default();
         runtime.confirm_notification_paint(false);
         assert_eq!(*runtime.smoke_paint.lock().unwrap(), None);
+    }
+
+    #[test]
+    fn context_menu_trace_is_not_collected_without_smoke_opt_in() {
+        let runtime = DesktopRuntime::default();
+        runtime.trace_context_menu(false, ContextMenuSmokePhase::ShowRequest, 1);
+        assert!(runtime.smoke_context_menu.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn context_menu_smoke_trace_keeps_only_the_latest_sixteen_closed_phase_events() {
+        let runtime = DesktopRuntime::default();
+        for generation in 1..=40 {
+            runtime.trace_context_menu(true, ContextMenuSmokePhase::ShowRequest, generation);
+        }
+        let trace = runtime.smoke_context_menu.lock().unwrap();
+        let trace = trace.as_ref().unwrap();
+        assert_eq!(trace.len(), CONTEXT_MENU_SMOKE_TRACE_LIMIT);
+        assert_eq!(trace.front().unwrap().generation, 25);
+        assert_eq!(trace.back().unwrap().generation, 40);
+        let event = serde_json::to_value(trace.front().unwrap()).unwrap();
+        assert_eq!(event["phase"], "show-request");
+        assert_eq!(event["generation"], 25);
+        assert!(event["elapsedMs"].is_u64());
+        assert_eq!(event.as_object().unwrap().len(), 3);
     }
 
     #[test]
