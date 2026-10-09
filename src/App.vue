@@ -163,7 +163,7 @@ let sessionValidationTimer: number | undefined
 let sessionRecoveryPromise: Promise<void> | undefined
 let sessionUnauthorizedEvidence: DesktopUnauthorizedEvidence | undefined
 let authCallbackTimer: number | undefined
-let releaseSmokePrepared = false
+const releaseSmokePrepared = ref(false)
 let sysMessageExpiryTimer: number | undefined
 let systemNotificationVisibilityRetryTimer: number | undefined
 let sysMessageEnrichmentGeneration = 0
@@ -1295,7 +1295,7 @@ onMounted(async () => {
     else if (!state.interactive) notificationDelivery.suspend()
   })
   if (windowMode === 'mascot') {
-    releaseSmokePrepared = await prepareDesktopReleaseSmokeState()
+    releaseSmokePrepared.value = await prepareDesktopReleaseSmokeState()
     recordDesktopDiagnostic('renderer.mascot_mounted', {
       token: userStore.token,
       tokenPresent: Boolean(userStore.token),
@@ -1304,9 +1304,9 @@ onMounted(async () => {
       userIdPresent: Boolean(userStore.userInfo?.userId),
       userIdMasked: maskDiagnosticIdentifier(userStore.userInfo?.userId),
       authenticated: userStore.isAuthenticated,
-      releaseSmokePrepared,
+      releaseSmokePrepared: releaseSmokePrepared.value,
     })
-    if (releaseSmokePrepared && userStore.isAuthenticated) {
+    if (releaseSmokePrepared.value && userStore.isAuthenticated) {
       recordDesktopReleaseSmokeRestart(true)
     }
     removeSystemNotificationActionListener = await listen<MascotSystemNotificationAction>(
@@ -1462,7 +1462,7 @@ onMounted(async () => {
         notificationDelivery.sync(null)
         connectDesktopSockets({ force: true })
         startSessionValidation()
-        if (releaseSmokePrepared) queueDesktopReleaseSmokeReminders()
+        if (releaseSmokePrepared.value) queueDesktopReleaseSmokeReminders()
         // The state-checked callback is the login completion signal. Socket and
         // message channels connect above; periodic validation continues later.
         mascotStore.showMessage('登录成功，消息提醒已开启', 'success', true)
