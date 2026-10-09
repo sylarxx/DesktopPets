@@ -23,6 +23,8 @@ export const MASCOT_CONTEXT_MENU_VISIBILITY_EVENT = 'mascot-context-menu-visibil
 export const MASCOT_SYSTEM_NOTIFICATION_READY_EVENT = 'mascot-system-notification-ready'
 export const MASCOT_SYSTEM_NOTIFICATION_PRESENT_EVENT = 'mascot-system-notification-present'
 export const MASCOT_SYSTEM_NOTIFICATION_LAYOUT_EVENT = 'mascot-system-notification-layout'
+export const MASCOT_SYSTEM_NOTIFICATION_PAINT_EVENT = 'mascot-system-notification-paint'
+export const MASCOT_SYSTEM_NOTIFICATION_VISIBILITY_EVENT = 'mascot-system-notification-visibility'
 export const MASCOT_SYSTEM_NOTIFICATION_ACTION_EVENT = 'mascot-system-notification-action'
 export type MascotDockSide = 'left' | 'right'
 
@@ -66,7 +68,7 @@ export type MascotSystemNotificationDelivery = NotificationDelivery<MascotSystem
 export type MascotSystemNotificationAction =
   | { action: 'login' }
   | { action: 'readAll' }
-  | { action: 'read' | 'view'; message: SysMessageNotification }
+  | { action: 'read' | 'view' | 'dismiss'; message: SysMessageNotification }
 
 export interface PanelActivityPayload {
   hasText: boolean

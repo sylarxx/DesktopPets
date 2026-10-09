@@ -2582,6 +2582,9 @@
 .mascot-avatar:active { filter: brightness(0.97); }
 
 .sys-message-tip__reading, .task-card__reading { display: contents; }
+.sys-message-tip__close { display: grid; place-items: center; width: 24px; height: 24px; padding: 3px; flex: 0 0 24px; border: 0; border-radius: 6px; background: transparent; color: inherit; cursor: pointer; opacity: .72; }
+.sys-message-tip__close:hover, .sys-message-tip__close:focus-visible { opacity: 1; background: rgba(255,255,255,.12); }
+.sys-message-tip__close svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; }
 @media (max-height: 220px) {
   .mascot-notification-window .sys-message-tip__reading,
   .pet-prompt.has-task .task-card__reading {

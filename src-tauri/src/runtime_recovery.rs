@@ -8,6 +8,8 @@ use std::sync::{
 use std::time::Instant;
 use tauri::{Emitter, Manager, PhysicalPosition, PhysicalSize, Position, Size};
 
+const MAIN_THREAD_STALL_TIMEOUT_MS: u64 = 25_000;
+
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RuntimeState {
@@ -41,6 +43,8 @@ pub struct DesktopRuntime {
     windows: Mutex<BTreeMap<String, RecoveryWindow>>,
     started: Instant,
     scheduled: AtomicBool,
+    scheduled_since: AtomicU64,
+    stall_reported: AtomicBool,
     smoke_session: AtomicI8,
     smoke_fail_creation: AtomicBool,
     last_resync: AtomicU64,
@@ -54,6 +58,8 @@ impl Default for DesktopRuntime {
             windows: Mutex::new(BTreeMap::new()),
             started: Instant::now(),
             scheduled: AtomicBool::new(false),
+            scheduled_since: AtomicU64::new(0),
+            stall_reported: AtomicBool::new(false),
             smoke_session: AtomicI8::new(-1),
             smoke_fail_creation: AtomicBool::new(false),
             last_resync: AtomicU64::new(0),
@@ -117,6 +123,27 @@ impl DesktopRuntime {
             .map(|windows| windows.values().any(|s| s.recreate))
             .unwrap_or(false)
     }
+
+    fn queued_tick_stalled(&self, now: u64) -> bool {
+        let since = self.scheduled_since.load(Ordering::SeqCst);
+        self.scheduled.load(Ordering::SeqCst)
+            && since != 0
+            && now.saturating_sub(since) > MAIN_THREAD_STALL_TIMEOUT_MS
+            && !self.stall_reported.swap(true, Ordering::SeqCst)
+    }
+
+    fn finish_tick(&self) {
+        self.scheduled_since.store(0, Ordering::SeqCst);
+        self.stall_reported.store(false, Ordering::SeqCst);
+        self.scheduled.store(false, Ordering::SeqCst);
+    }
+
+    fn restart_pending_tick_grace(&self, now: u64) {
+        if self.scheduled.load(Ordering::SeqCst) {
+            self.scheduled_since.store(now.max(1), Ordering::SeqCst);
+            self.stall_reported.store(false, Ordering::SeqCst);
+        }
+    }
 }
 
 pub fn initialize(app: &tauri::AppHandle) {
@@ -168,6 +195,9 @@ pub fn session_changed(app: &tauri::AppHandle, interactive: bool, force: bool) {
         .unwrap()
         .session(interactive, runtime.now(), force);
     if changed {
+        // Suspension can stop both the Windows UI loop and this observer.
+        // Do not count locked/sleeping time as failure of the pending probe.
+        runtime.restart_pending_tick_grace(runtime.now());
         runtime.record(
             if interactive {
                 "session-interactive"
@@ -324,20 +354,25 @@ pub fn schedule_tick(app: &tauri::AppHandle) {
     // There can only be one queued main-thread probe even if its message loop
     // stalls. The independent Windows observer keeps handling lock/resume.
     if runtime.scheduled.swap(true, Ordering::SeqCst) {
+        if runtime.interactive() && runtime.queued_tick_stalled(runtime.now()) {
+            // Evidence only: a blocked UI loop cannot execute window repair.
+            // Leave its single queued probe intact; do not queue more UI work.
+            runtime.record("main-thread-probe-stalled", "");
+        }
         return;
     }
+    runtime
+        .scheduled_since
+        .store(runtime.now().max(1), Ordering::SeqCst);
     let handle = app.clone();
     if app
         .run_on_main_thread(move || {
             tick(&handle);
-            handle
-                .state::<DesktopRuntime>()
-                .scheduled
-                .store(false, Ordering::SeqCst);
+            handle.state::<DesktopRuntime>().finish_tick();
         })
         .is_err()
     {
-        runtime.scheduled.store(false, Ordering::SeqCst);
+        runtime.finish_tick();
     }
 }
 
@@ -541,6 +576,9 @@ fn finish_mounted_windows(app: &tauri::AppHandle) {
         let Some(window) = app.get_webview_window(&label) else {
             continue;
         };
+        if label == "mascot-notification" {
+            crate::revoke_mascot_system_notification_visibility(app);
+        }
         let _ = crate::hide_transparent_window_safely(&window);
         let _ = window.set_position(Position::Physical(snapshot.position));
         let _ = window.set_size(Size::Physical(snapshot.size));
@@ -617,6 +655,12 @@ pub fn handle_smoke_command(app: &tauri::AppHandle, arguments: &[String]) -> boo
                             sequence: {sequence},
                             draftPresent: localStorage.getItem('huali_ai_todo_input_draft') === 'runtime-recovery-draft',
                             domPresent: !!document.querySelector('#app > *'),
+                            notificationVisible: document.querySelector('.app-shell')?.getAttribute('data-notification-visible') === 'true',
+                            cardPresent: (() => {{
+                                const card = document.querySelector('.mascot-notification-window > *');
+                                const bounds = card?.getBoundingClientRect();
+                                return !!(bounds && bounds.width > 0 && bounds.height > 0 && card.textContent?.trim());
+                            }})(),
                             pointerCount: window.__runtimeSmokePointerCount,
                         }}).catch(() => {{}});
                     "#));
@@ -634,6 +678,8 @@ pub fn desktop_runtime_smoke_receipt(
     sequence: u64,
     draft_present: bool,
     dom_present: bool,
+    notification_visible: bool,
+    card_present: bool,
     pointer_count: u64,
 ) -> bool {
     if !smoke_enabled() {
@@ -666,7 +712,9 @@ pub fn desktop_runtime_smoke_receipt(
         };
         serde_json::json!({
             "sequence": sequence, "draftPresent": draft_present,
-            "domPresent": dom_present, "pointerCount": pointer_count,
+            "domPresent": dom_present, "cardPresent": card_present,
+            "notificationVisible": notification_visible,
+            "pointerCount": pointer_count,
             "processId": std::process::id(), "epoch": h.epoch,
             "interactive": h.interactive, "repairs": view.repairs,
             "generation": view.native_generation, "mounted": view.application_ready,
@@ -691,4 +739,48 @@ pub fn desktop_runtime_smoke_receipt(
     serde_json::to_vec(&receipt)
         .ok()
         .is_some_and(|bytes| std::fs::write(path, bytes).is_ok())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn main_thread_stall_is_reported_once_per_pending_probe_and_resets_after_completion() {
+        let runtime = DesktopRuntime::default();
+        runtime.scheduled.store(true, Ordering::SeqCst);
+        runtime.scheduled_since.store(1_000, Ordering::SeqCst);
+        assert!(!runtime.queued_tick_stalled(26_000));
+        assert!(runtime.queued_tick_stalled(26_001));
+        assert!(!runtime.queued_tick_stalled(90_000));
+        runtime.finish_tick();
+        assert!(!runtime.queued_tick_stalled(120_000));
+
+        runtime.scheduled.store(true, Ordering::SeqCst);
+        runtime.scheduled_since.store(120_000, Ordering::SeqCst);
+        assert!(runtime.queued_tick_stalled(145_001));
+    }
+
+    #[test]
+    fn main_thread_stall_ignores_unqueued_or_uninitialized_probe() {
+        let runtime = DesktopRuntime::default();
+        assert!(!runtime.queued_tick_stalled(u64::MAX));
+        runtime.scheduled.store(true, Ordering::SeqCst);
+        assert!(!runtime.queued_tick_stalled(u64::MAX));
+        runtime.scheduled_since.store(500, Ordering::SeqCst);
+        assert!(!runtime.queued_tick_stalled(100));
+    }
+
+    #[test]
+    fn resumed_session_restarts_pending_probe_grace_without_queuing_more_work() {
+        let runtime = DesktopRuntime::default();
+        runtime.scheduled.store(true, Ordering::SeqCst);
+        runtime.scheduled_since.store(1_000, Ordering::SeqCst);
+        assert!(runtime.queued_tick_stalled(26_001));
+        let resumed = 8 * 3_600_000;
+        runtime.restart_pending_tick_grace(resumed);
+        assert!(runtime.scheduled.load(Ordering::SeqCst));
+        assert!(!runtime.queued_tick_stalled(resumed + 25_000));
+        assert!(runtime.queued_tick_stalled(resumed + 25_001));
+    }
 }

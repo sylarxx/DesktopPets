@@ -29,10 +29,14 @@ jobs:
       - name: Frontend recovery behavior
         run: >-
           npm test -- src/utils/notification-delivery.test.ts
+          src/utils/notification-paint.test.ts src/utils/sys-message-dismissal.test.ts
+          src/utils/sys-message-action-error.test.ts src/services/request.test.ts
+          src/utils/notification-task-contract.test.ts
           src/utils/recovery-storage.test.ts src/services/sys-message.service.test.ts
           src/services/websocket.service.test.ts src/services/runtime-recovery.service.test.ts src/stores/task.test.ts
           src/utils/mascot-panel-access.test.ts
       - run: node scripts/qa/check-runtime-recovery.mjs
+      - run: node scripts/qa/check-message-action-lifetime.mjs
       - run: npm run build:intranet
       - name: Native recovery policy and compilation
         shell: pwsh

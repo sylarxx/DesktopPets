@@ -73,6 +73,7 @@ const DESKTOP_RELEASE_SMOKE_NONCE_ENV: &str = "HUALI_AI_RELEASE_SMOKE_NONCE";
 const PANEL_VISIBILITY_EVENT: &str = "huali:panel-visibility";
 const MASCOT_CONTEXT_MENU_VISIBILITY_EVENT: &str = "mascot-context-menu-visibility";
 const MASCOT_SYSTEM_NOTIFICATION_READY_EVENT: &str = "mascot-system-notification-ready";
+const MASCOT_SYSTEM_NOTIFICATION_VISIBILITY_EVENT: &str = "mascot-system-notification-visibility";
 const MASCOT_NATIVE_REVEALED_EVENT: &str = "mascot-native-revealed";
 #[cfg(windows)]
 const MASCOT_NATIVE_HOVER_REVEALED_EVENT: &str = "mascot-native-hover-revealed";
@@ -221,6 +222,28 @@ impl MascotSystemNotificationState {
             .lock()
             .ok()
             .and_then(|status| status.visible.then_some(status.visible_compact))
+    }
+
+    fn confirms_visible_client_generation(&self, client_generation: u64) -> bool {
+        self.status
+            .lock()
+            .map(|status| {
+                status.ready
+                    && status.desired_visible
+                    && status.visible
+                    && status.client_generation == client_generation
+            })
+            .unwrap_or(false)
+    }
+
+    fn revoke_visibility(&self) -> u64 {
+        self.status
+            .lock()
+            .map(|mut status| {
+                status.visible = false;
+                status.client_generation
+            })
+            .unwrap_or(0)
     }
 }
 
@@ -2452,6 +2475,39 @@ mod mascot_position_tests {
     }
 
     #[test]
+    fn notification_visible_receipt_requires_current_completed_native_show() {
+        let state = MascotSystemNotificationState::default();
+        assert!(!state.confirms_visible_client_generation(1));
+        state.mark_ready().unwrap();
+        let generation = state.request_show(false, Some(2)).unwrap().unwrap();
+        assert!(!state.confirms_visible_client_generation(2));
+        assert!(state.mark_visible(generation, false));
+        assert!(state.confirms_visible_client_generation(2));
+        assert!(!state.confirms_visible_client_generation(1));
+
+        state.request_hide(Some(3)).unwrap().unwrap();
+        // A physical hide may still be queued; logical hide invalidates the old
+        // renderer receipt immediately, before that window call completes.
+        assert!(!state.confirms_visible_client_generation(2));
+        assert!(!state.confirms_visible_client_generation(3));
+    }
+
+    #[test]
+    fn notification_native_revoke_invalidates_receipt_without_advancing_client_watermark() {
+        let state = MascotSystemNotificationState::default();
+        state.mark_ready().unwrap();
+        let generation = state.request_show(false, Some(7)).unwrap().unwrap();
+        assert!(state.mark_visible(generation, false));
+        assert_eq!(state.revoke_visibility(), 7);
+        assert!(!state.confirms_visible_client_generation(7));
+        assert_eq!(state.request_show(false, Some(7)).unwrap(), None);
+        let replacement = state.request_show(false, Some(8)).unwrap().unwrap();
+        assert!(state.mark_visible(replacement, false));
+        assert!(!state.confirms_visible_client_generation(7));
+        assert!(state.confirms_visible_client_generation(8));
+    }
+
+    #[test]
     fn notification_show_hide_show_generations_reject_stale_native_transitions() {
         let state = MascotSystemNotificationState::default();
         assert_eq!(state.request_show(false, Some(1)).unwrap(), None);
@@ -4086,6 +4142,25 @@ fn hide_context_menu_after_focus_moves_outside_app(app: tauri::AppHandle) {
     });
 }
 
+fn emit_mascot_system_notification_visibility(
+    app: &tauri::AppHandle,
+    client_generation: u64,
+    visible: bool,
+) -> bool {
+    app.emit_to(
+        "mascot",
+        MASCOT_SYSTEM_NOTIFICATION_VISIBILITY_EVENT,
+        serde_json::json!({ "generation": client_generation, "visible": visible }),
+    )
+    .is_ok()
+}
+
+fn revoke_mascot_system_notification_visibility(app: &tauri::AppHandle) {
+    let state = app.state::<MascotSystemNotificationState>();
+    let client_generation = state.revoke_visibility();
+    let _ = emit_mascot_system_notification_visibility(app, client_generation, false);
+}
+
 fn hide_mascot_system_notification_native_window_with_generation(
     app: &tauri::AppHandle,
     client_generation: Option<u64>,
@@ -4095,27 +4170,27 @@ fn hide_mascot_system_notification_native_window_with_generation(
         Ok(Some(generation)) => generation,
         Ok(None) => return,
         Err(_) => {
+            revoke_mascot_system_notification_visibility(app);
             if let Some(window) = app.get_webview_window("mascot-notification") {
                 let _ = hide_transparent_window_safely(&window);
-                state.mark_physical_hidden();
             }
             return;
         }
     };
     let Ok(_transition) = state.transition.lock() else {
+        revoke_mascot_system_notification_visibility(app);
         if let Some(window) = app.get_webview_window("mascot-notification") {
             let _ = hide_transparent_window_safely(&window);
-            state.mark_physical_hidden();
         }
         return;
     };
     if !state.can_hide(generation) {
         return;
     }
+    revoke_mascot_system_notification_visibility(app);
     if let Some(window) = app.get_webview_window("mascot-notification") {
         let _ = hide_transparent_window_safely(&window);
     }
-    state.mark_physical_hidden();
 }
 
 fn hide_mascot_system_notification_native_window(app: &tauri::AppHandle) {
@@ -4213,10 +4288,10 @@ fn set_mascot_system_notification_ready(
         return false;
     };
     if first_ready {
+        revoke_mascot_system_notification_visibility(&app);
         if let Some(window) = app.get_webview_window("mascot-notification") {
             let _ = hide_transparent_window_safely(&window);
         }
-        state.mark_physical_hidden();
     }
     // Re-announcing renderer readiness must never hide a successfully shown card.
     app.emit_to("mascot", MASCOT_SYSTEM_NOTIFICATION_READY_EVENT, ())
@@ -4228,6 +4303,41 @@ fn is_mascot_system_notification_ready(
     state: tauri::State<'_, MascotSystemNotificationState>,
 ) -> bool {
     state.is_ready()
+}
+
+#[tauri::command]
+fn ack_mascot_system_notification_visible(
+    window: tauri::WebviewWindow,
+    state: tauri::State<'_, MascotSystemNotificationState>,
+    client_generation: u64,
+) -> bool {
+    let runtime = window.state::<runtime_recovery::DesktopRuntime>();
+    if window.label() != "mascot-notification"
+        || !runtime.interactive()
+        || !state.confirms_visible_client_generation(client_generation)
+    {
+        runtime.record("notification-visible-rejected", window.label());
+        return false;
+    }
+    // The renderer's two-frame receipt alone cannot establish HWND visibility.
+    // Check the real native window after the show, without keeping a status or
+    // transition mutex across a getter that may marshal to the UI thread.
+    let visible = matches!(window.is_visible(), Ok(true));
+    if !visible || !state.confirms_visible_client_generation(client_generation) {
+        runtime.record("notification-visible-rejected", window.label());
+        return false;
+    }
+    let emitted =
+        emit_mascot_system_notification_visibility(window.app_handle(), client_generation, true);
+    runtime.record(
+        if emitted {
+            "notification-visible-confirmed"
+        } else {
+            "notification-visible-receipt-failed"
+        },
+        window.label(),
+    );
+    emitted
 }
 
 #[tauri::command]
@@ -5081,6 +5191,7 @@ fn reset_window_for_runtime_recovery(app: &tauri::AppHandle, label: &str) {
         hide_mascot_context_menu_window(app);
         hide_mascot_system_notification_native_window(app);
     } else if label == "mascot-notification" {
+        revoke_mascot_system_notification_visibility(app);
         let state = app.state::<MascotSystemNotificationState>();
         if let Ok(mut status) = state.status.lock() {
             let generation = status.generation.wrapping_add(1);
@@ -5325,6 +5436,7 @@ fn main() {
             set_mascot_context_menu_ready,
             set_mascot_system_notification_ready,
             is_mascot_system_notification_ready,
+            ack_mascot_system_notification_visible,
             show_mascot_system_notification_window,
             hide_mascot_system_notification_window,
             show_main_window,

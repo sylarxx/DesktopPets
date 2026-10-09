@@ -19,6 +19,9 @@ const messageListeners = new Set<MessageListener>()
 const knownMessageIds = new Set<string>()
 const SYS_MESSAGE_POLL_INTERVAL = 10_000
 const MAX_KNOWN_MESSAGE_IDS = 500
+const READ_RECONCILIATION_PAGE_SIZE = 20
+const READ_RECONCILIATION_MAX_PAGES = 5
+const READ_RECONCILIATION_TIMEOUT_MS = 10_000
 
 interface LocationLike {
   protocol: string
@@ -39,6 +42,7 @@ interface SysMessageBackendItem {
 interface SysMessagePagePayload {
   rows?: SysMessageBackendItem[] | null
   list?: SysMessageBackendItem[] | null
+  total?: number | string | null
 }
 
 function notifyMessage(message: SysMessageNotification, source: string) {
@@ -120,6 +124,41 @@ function normalizeSysMessageItem(payload: SysMessageBackendItem): SysMessageNoti
 function normalizeSysMessage(payload: SysMessagePushPayload): SysMessageNotification | null {
   if (payload.type !== 'sys_message') return null
   return normalizeSysMessageItem(payload)
+}
+
+async function confirmMessagesAlreadyRead(ids: string[]) {
+  const remainingIds = new Set(ids)
+  const seenIds = new Set<string>()
+  const startedAt = Date.now()
+  // The backend reports whether an unread row was changed, not whether the
+  // requested state is already satisfied. Another client (or a timed-out
+  // earlier write) can therefore make a legitimate retry return false.
+  // There is no single-message endpoint: confirm only IDs explicitly observed
+  // in this authenticated user's read list, with a bounded read-only lookup.
+  for (let pageNum = 1; pageNum <= READ_RECONCILIATION_MAX_PAGES; pageNum += 1) {
+    const timeoutMs = READ_RECONCILIATION_TIMEOUT_MS - (Date.now() - startedAt)
+    if (timeoutMs <= 0) break
+    const payload = await request.get<unknown, SysMessagePagePayload>('/sys-message/page', {
+      params: { pageNum, pageSize: READ_RECONCILIATION_PAGE_SIZE, msgStatus: 1 },
+      timeoutMs,
+    })
+    const rows = payload?.rows ?? payload?.list ?? []
+    let added = 0
+    for (const row of rows) {
+      const id = toId(row.id)
+      if (id && !seenIds.has(id)) {
+        seenIds.add(id)
+        added += 1
+      }
+      if (Number(row.msgStatus) === 1) remainingIds.delete(id)
+    }
+    if (!remainingIds.size) return true
+    const total = payload?.total === null || payload?.total === undefined
+      ? undefined : Number(payload.total)
+    if (rows.length < READ_RECONCILIATION_PAGE_SIZE || added === 0
+      || (total !== undefined && Number.isFinite(total) && pageNum * READ_RECONCILIATION_PAGE_SIZE >= total)) break
+  }
+  return false
 }
 
 function toWsProtocol(protocol: string) {
@@ -419,7 +458,9 @@ export const sysMessageService = {
     const markedRead = await request.put<unknown, boolean>('/sys-message/read', {
       ids: [normalizeRequestId(message.rawId)],
     })
-    if (markedRead !== true) throw new Error('服务端未确认消息已读')
+    if (markedRead !== true && !(markedRead === false && await confirmMessagesAlreadyRead([message.id]))) {
+      throw new Error('服务端未确认消息已读')
+    }
     message.msgStatus = 1
     return true
   },
@@ -431,7 +472,9 @@ export const sysMessageService = {
     if (!ids.length) return true
 
     const markedRead = await request.put<unknown, boolean>('/sys-message/read', { ids })
-    if (markedRead !== true) throw new Error('服务端未确认全部消息已读')
+    if (markedRead !== true && !(markedRead === false && await confirmMessagesAlreadyRead(unreadMessages.map(message => message.id)))) {
+      throw new Error('服务端未确认全部消息已读')
+    }
     unreadMessages.forEach((message) => {
       message.msgStatus = 1
     })

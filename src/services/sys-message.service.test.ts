@@ -59,6 +59,13 @@ class FakeWebSocket {
 
 import { sysMessageService } from './sys-message.service'
 
+function unreadMessage(id: string | number = 101) {
+  return {
+    id: String(id), rawId: id, dedupeKey: String(id), msgSubject: '待办提醒',
+    msgContent: '', msgStatus: 0 as const, msgType: 1,
+  }
+}
+
 describe('sysMessageService', () => {
   beforeEach(() => {
     vi.useFakeTimers()
@@ -160,6 +167,98 @@ describe('sysMessageService', () => {
     expect(message.msgStatus).toBe(0)
   })
 
+  it('accepts a false retry only after the same message is explicitly confirmed already read', async () => {
+    mocks.put.mockResolvedValue(false)
+    mocks.get.mockResolvedValue({ rows: [{ id: 101, msgStatus: 1 }], total: 1 })
+    const message = unreadMessage()
+
+    await expect(sysMessageService.markRead(message)).resolves.toBe(true)
+
+    expect(message.msgStatus).toBe(1)
+    expect(mocks.get).toHaveBeenCalledWith('/sys-message/page', {
+      params: { pageNum: 1, pageSize: 20, msgStatus: 1 }, timeoutMs: 10_000,
+    })
+  })
+
+  it('does not infer success from a different read message or an unread matching row', async () => {
+    mocks.put.mockResolvedValue(false)
+    mocks.get.mockResolvedValue({ rows: [
+      { id: 102, msgStatus: 1 }, { id: 101, msgStatus: 0 },
+    ] })
+    const message = unreadMessage()
+
+    await expect(sysMessageService.markRead(message)).rejects.toThrow('服务端未确认消息已读')
+    expect(message.msgStatus).toBe(0)
+  })
+
+  it('preserves reconciliation errors and leaves the message unread', async () => {
+    const error = new Error('登录状态已过期')
+    mocks.put.mockResolvedValue(false)
+    mocks.get.mockRejectedValue(error)
+    const message = unreadMessage()
+
+    await expect(sysMessageService.markRead(message)).rejects.toBe(error)
+    expect(message.msgStatus).toBe(0)
+  })
+
+  it('does not extend failed or timed-out writes with a second HTTP operation', async () => {
+    const error = new Error('连接后台服务超时，操作结果尚未确认')
+    mocks.put.mockRejectedValue(error)
+    const message = unreadMessage()
+
+    await expect(sysMessageService.markRead(message)).rejects.toBe(error)
+    expect(mocks.get).not.toHaveBeenCalled()
+    expect(message.msgStatus).toBe(0)
+  })
+
+  it('does not treat an absent read result as an already-read response', async () => {
+    mocks.put.mockResolvedValue(undefined)
+    const message = unreadMessage()
+
+    await expect(sysMessageService.markRead(message)).rejects.toThrow('服务端未确认消息已读')
+    expect(mocks.get).not.toHaveBeenCalled()
+    expect(message.msgStatus).toBe(0)
+  })
+
+  it('finds an already-read message on a later read page', async () => {
+    mocks.put.mockResolvedValue(false)
+    mocks.get.mockResolvedValueOnce({ rows: Array.from({ length: 20 }, (_, index) => ({
+      id: 200 + index, msgStatus: 1,
+    })), total: 21 }).mockResolvedValueOnce({ rows: [{ id: 101, msgStatus: 1 }], total: 21 })
+    const message = unreadMessage()
+
+    await expect(sysMessageService.markRead(message)).resolves.toBe(true)
+    expect(mocks.get).toHaveBeenCalledTimes(2)
+    expect(message.msgStatus).toBe(1)
+  })
+
+  it('bounds reconciliation to five pages and one hundred rows without declaring an unseen message read', async () => {
+    mocks.put.mockResolvedValue(false)
+    mocks.get.mockImplementation((_path, options) => ({ rows: Array.from({ length: 20 }, (_, index) => ({
+      id: 1000 + options.params.pageNum * 20 + index, msgStatus: 1,
+    })), total: 500 }))
+    const message = unreadMessage()
+
+    await expect(sysMessageService.markRead(message)).rejects.toThrow('服务端未确认消息已读')
+    expect(mocks.get).toHaveBeenCalledTimes(5)
+    expect(message.msgStatus).toBe(0)
+  })
+
+  it('shares one ten-second reconciliation deadline across pages', async () => {
+    mocks.put.mockResolvedValue(false)
+    mocks.get.mockImplementation((_path, options) => {
+      vi.setSystemTime(Date.now() + 3000)
+      return { rows: Array.from({ length: 20 }, (_, index) => ({
+        id: 1000 + options.params.pageNum * 20 + index, msgStatus: 1,
+      })), total: 500 }
+    })
+    const message = unreadMessage()
+
+    await expect(sysMessageService.markRead(message)).rejects.toThrow('服务端未确认消息已读')
+    expect(mocks.get.mock.calls.map(call => call[1].timeoutMs)).toEqual([10_000, 7000, 4000, 1000])
+    expect(message.msgStatus).toBe(0)
+  })
+
   it('marks the current and queued messages as read in one request', async () => {
     mocks.get.mockResolvedValue({ rows: [] })
     mocks.put.mockResolvedValue(true)
@@ -198,6 +297,24 @@ describe('sysMessageService', () => {
       '服务端未确认全部消息已读'
     )
     expect(messages.map((message) => message.msgStatus)).toEqual([0, 0])
+  })
+
+  it('confirms every selected ID before accepting a false batch read', async () => {
+    mocks.put.mockResolvedValue(false)
+    mocks.get.mockResolvedValue({ rows: [{ id: 101, msgStatus: 1 }, { id: '102', msgStatus: 1 }] })
+    const messages = [unreadMessage(101), unreadMessage('102')]
+
+    await expect(sysMessageService.markAllRead(messages)).resolves.toBe(true)
+    expect(messages.map(message => message.msgStatus)).toEqual([1, 1])
+  })
+
+  it('does not accept a false batch read when only part of the selection is confirmed read', async () => {
+    mocks.put.mockResolvedValue(false)
+    mocks.get.mockResolvedValue({ rows: [{ id: 101, msgStatus: 1 }] })
+    const messages = [unreadMessage(101), unreadMessage(102)]
+
+    await expect(sysMessageService.markAllRead(messages)).rejects.toThrow('服务端未确认全部消息已读')
+    expect(messages.map(message => message.msgStatus)).toEqual([0, 0])
   })
 
   it('忽略退出或切换用户后才返回的旧轮询结果', async () => {

@@ -20,6 +20,7 @@ const emit = defineEmits<{
   view: [message: SysMessageNotification]
   read: [message: SysMessageNotification]
   readAll: []
+  dismiss: [message: SysMessageNotification]
 }>()
 
 const title = computed(() => props.message.msgSubject || '站内消息')
@@ -84,6 +85,15 @@ const announcement = computed(() => {
           <span v-if="pendingLabel" class="sys-message-tip__queue-count">{{ pendingLabel }}</span>
           <time class="sys-message-tip__time" :datetime="dateTimeValue">{{ displayTime }}</time>
         </span>
+        <button
+          class="sys-message-tip__close"
+          type="button"
+          aria-label="关闭此提醒"
+          title="关闭提醒，消息仍可在工作台查看"
+          @click.stop="emit('dismiss', message)"
+        >
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18" /></svg>
+        </button>
       </header>
 
       <div class="sys-message-tip__body" tabindex="0">

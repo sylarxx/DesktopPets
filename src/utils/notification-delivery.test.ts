@@ -8,11 +8,12 @@ function setup() {
   const hide = vi.fn(async () => true)
   const onVisible = vi.fn()
   const onStopped = vi.fn()
+  const confirmVisible = vi.fn(async (generation: number) => { delivery.acknowledgeVisible(generation) })
   const delivery = createNotificationDelivery<string>({
     nextGeneration: () => ++generation, key: (value) => value.split(':')[0],
-    publish, show, hide, onVisible, onStopped,
+    publish, show, confirmVisible, hide, onVisible, onStopped,
   })
-  return { delivery, publish, show, hide, onVisible, onStopped }
+  return { delivery, publish, show, confirmVisible, hide, onVisible, onStopped }
 }
 
 describe('bounded notification delivery', () => {
@@ -29,6 +30,104 @@ describe('bounded notification delivery', () => {
     await vi.advanceTimersByTimeAsync(60_000)
     expect(h.show).toHaveBeenCalledWith(1, 'meeting')
     expect(h.onVisible).toHaveBeenLastCalledWith('meeting')
+    expect(vi.getTimerCount()).toBe(0)
+    h.delivery.dispose()
+  })
+
+  it('does not declare a shown HWND visible until the current post-show receipt', async () => {
+    const h = setup()
+    h.confirmVisible.mockImplementation(async () => {})
+    h.delivery.sync('meeting')
+    h.delivery.acknowledgeVisible(1)
+    h.delivery.acknowledge(1)
+    await vi.advanceTimersByTimeAsync(0)
+    expect(h.show).toHaveBeenCalledOnce()
+    expect(h.confirmVisible).toHaveBeenCalledWith(1)
+    expect(h.onVisible).not.toHaveBeenCalledWith('meeting')
+    h.delivery.acknowledge(1)
+    h.delivery.acknowledgeVisible(0)
+    expect(h.onVisible).not.toHaveBeenCalledWith('meeting')
+    h.delivery.acknowledgeVisible(1)
+    await vi.advanceTimersByTimeAsync(0)
+    expect(h.onVisible).toHaveBeenLastCalledWith('meeting')
+    h.delivery.dispose()
+  })
+
+  it('releases an unpainted card after a bounded round and rejects a late receipt', async () => {
+    const h = setup()
+    h.confirmVisible.mockImplementation(async () => {})
+    h.publish.mockImplementation(async ({ generation }) => h.delivery.acknowledge(generation))
+    h.delivery.sync('meeting')
+    await vi.advanceTimersByTimeAsync(10_000)
+    expect(h.show).toHaveBeenCalledTimes(3)
+    expect(h.onStopped).toHaveBeenCalledWith('meeting')
+    expect(h.onVisible).not.toHaveBeenCalledWith('meeting')
+    const generation = h.confirmVisible.mock.calls[h.confirmVisible.mock.calls.length - 1]![0]
+    h.delivery.acknowledgeVisible(generation)
+    await vi.advanceTimersByTimeAsync(60_000)
+    expect(h.onVisible).not.toHaveBeenCalledWith('meeting')
+    expect(vi.getTimerCount()).toBe(0)
+    h.delivery.dispose()
+  })
+
+  it('revokes the original native show watermark after content updates and ignores old hides', async () => {
+    const h = setup()
+    h.delivery.sync('meeting')
+    h.delivery.acknowledge(1)
+    await vi.advanceTimersByTimeAsync(0)
+    h.delivery.sync('meeting:updated')
+    await vi.advanceTimersByTimeAsync(0)
+    h.delivery.revokeVisibility(1)
+    expect(h.onVisible).toHaveBeenLastCalledWith(null)
+    h.delivery.recover('repair:2', 'meeting:updated')
+    await vi.advanceTimersByTimeAsync(0)
+    const generation = h.publish.mock.calls[h.publish.mock.calls.length - 1]![0].generation
+    h.delivery.acknowledge(generation)
+    await vi.advanceTimersByTimeAsync(0)
+    h.delivery.revokeVisibility(1)
+    expect(h.onVisible).toHaveBeenLastCalledWith('meeting:updated')
+    expect(h.show).toHaveBeenCalledTimes(2)
+    h.delivery.dispose()
+  })
+
+  it('does not reinstate visibility when a native hide follows a receipt before continuation', async () => {
+    const h = setup()
+    h.confirmVisible.mockImplementation(async (generation) => {
+      h.delivery.acknowledgeVisible(generation)
+      h.delivery.revokeVisibility(generation)
+    })
+    h.delivery.sync('meeting')
+    h.delivery.acknowledge(1)
+    await vi.advanceTimersByTimeAsync(0)
+    expect(h.onVisible).not.toHaveBeenCalledWith('meeting')
+    h.delivery.acknowledgeVisible(1)
+    expect(h.onVisible).not.toHaveBeenCalledWith('meeting')
+    h.delivery.dispose()
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it('restores a natively revoked card with the same content once, and bounds duplicate hides', async () => {
+    const h = setup()
+    h.delivery.sync('meeting')
+    h.delivery.acknowledge(1)
+    await vi.advanceTimersByTimeAsync(20_000)
+    expect(h.delivery.revokeVisibility(1)).toBe(true)
+    expect(h.delivery.revokeVisibility(1)).toBe(false)
+    h.confirmVisible.mockImplementation(async () => {})
+    h.delivery.sync('meeting')
+    await vi.advanceTimersByTimeAsync(0)
+    h.delivery.acknowledge(2)
+    await vi.advanceTimersByTimeAsync(0)
+    expect(h.show).toHaveBeenCalledTimes(2)
+    for (let i = 0; i < 20; i += 1) {
+      h.delivery.revokeVisibility(1)
+      h.delivery.sync('meeting')
+    }
+    await vi.advanceTimersByTimeAsync(60_000)
+    expect(h.onStopped).toHaveBeenCalledTimes(1)
+    h.delivery.sync('meeting')
+    await vi.advanceTimersByTimeAsync(60_000)
+    expect(h.onStopped).toHaveBeenCalledTimes(1)
     expect(vi.getTimerCount()).toBe(0)
     h.delivery.dispose()
   })

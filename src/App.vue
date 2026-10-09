@@ -36,6 +36,8 @@ import {
   MASCOT_SYSTEM_NOTIFICATION_ACTION_EVENT,
   MASCOT_SYSTEM_NOTIFICATION_PRESENT_EVENT,
   MASCOT_SYSTEM_NOTIFICATION_LAYOUT_EVENT,
+  MASCOT_SYSTEM_NOTIFICATION_PAINT_EVENT,
+  MASCOT_SYSTEM_NOTIFICATION_VISIBILITY_EVENT,
   MASCOT_SYSTEM_NOTIFICATION_READY_EVENT,
   hideMascotSystemNotificationWindow,
   hidePanelWindow,
@@ -65,6 +67,8 @@ import type { TaskCreatedEvent } from './types/task'
 import { env } from './utils/env'
 import { storage } from './utils/storage'
 import { createNotificationDelivery } from './utils/notification-delivery'
+import { dismissSysMessage, isSysMessageDismissed } from './utils/sys-message-dismissal'
+import { formatSysMessageActionError } from './utils/sys-message-action-error'
 import {
   SYS_MESSAGE_EXPIRY_MS,
   isSysMessageExpired,
@@ -109,11 +113,16 @@ const hasTaskPreviewQueue = isTaskPreview && searchParams.get('previewQueue') ==
 const hasTaskPreviewError = isTaskPreview && searchParams.get('previewError') === '1'
 const hasTaskPreviewLongContent = isTaskPreview && searchParams.get('previewLong') === '1'
 const socketStatus = ref(env.enableMock ? 'mock' : 'closed')
+function canRestoreSysMessage(message: ResolvedSysMessage | null | undefined): message is ResolvedSysMessage {
+  return Boolean(message && typeof message.id === 'string' && typeof message.dedupeKey === 'string'
+    && !isSysMessageExpired(message.expiresAt)
+    && !isSysMessageDismissed(userStore.userInfo?.userId || '', message))
+}
 const currentSysMessage = ref<ResolvedSysMessage | null>(
-  savedMascot?.current && !isSysMessageExpired(savedMascot.current.expiresAt) ? savedMascot.current : null,
+  canRestoreSysMessage(savedMascot?.current) ? savedMascot!.current : null,
 )
-const sysMessageQueue = ref<ResolvedSysMessage[]>(Array.isArray(savedMascot?.queue) ? savedMascot.queue.filter(m => m && typeof m.dedupeKey === 'string' && !isSysMessageExpired(m.expiresAt)) : [])
-const deferredSysMessages = ref<ResolvedSysMessage[]>(Array.isArray(savedMascot?.deferred) ? savedMascot.deferred.filter(m => m && typeof m.dedupeKey === 'string' && !isSysMessageExpired(m.expiresAt)) : [])
+const sysMessageQueue = ref<ResolvedSysMessage[]>(Array.isArray(savedMascot?.queue) ? savedMascot.queue.filter(canRestoreSysMessage) : [])
+const deferredSysMessages = ref<ResolvedSysMessage[]>(Array.isArray(savedMascot?.deferred) ? savedMascot.deferred.filter(canRestoreSysMessage) : [])
 const runtimeInteractive = ref(true)
 let removeRuntimeRecovery: (() => void) | undefined
 let runtimeRecovered = false
@@ -146,6 +155,7 @@ let removeSysMessageListener: (() => void) | undefined
 let removeSystemNotificationActionListener: UnlistenFn | undefined
 let removeSystemNotificationReadyListener: UnlistenFn | undefined
 let removeSystemNotificationLayoutListener: UnlistenFn | undefined
+let removeSystemNotificationVisibilityListener: UnlistenFn | undefined
 let removeContextMenuVisibilityListener: UnlistenFn | undefined
 let removeDeepLinkListener: UnlistenFn | undefined
 let removeUnauthorizedListener: (() => void) | undefined
@@ -155,6 +165,7 @@ let sessionUnauthorizedEvidence: DesktopUnauthorizedEvidence | undefined
 let authCallbackTimer: number | undefined
 let releaseSmokePrepared = false
 let sysMessageExpiryTimer: number | undefined
+let systemNotificationVisibilityRetryTimer: number | undefined
 let sysMessageEnrichmentGeneration = 0
 let systemNotificationPresentationGeneration = 0
 // Leave enough sequence space between renderer lifetimes so a late IPC from a
@@ -191,6 +202,9 @@ const notificationDelivery = createNotificationDelivery<MascotSystemNotification
     })
     return notificationShown
   },
+  confirmVisible: (generation) => emitTo(
+    'mascot-notification', MASCOT_SYSTEM_NOTIFICATION_PAINT_EVENT, { generation },
+  ),
   hide: (generation) => hideMascotSystemNotificationWindow(generation),
   key: (presentation) => presentation.kind === 'auth' ? 'auth' : presentation.message.dedupeKey,
   onStopped: handleNotificationStopped,
@@ -272,6 +286,10 @@ function persistRecoveryState() {
   }
 }
 
+function isLocallyDismissed(message: SysMessageNotification) {
+  return isSysMessageDismissed(sysMessageUserId.value, message)
+}
+
 watch([currentSysMessage, sysMessageQueue, deferredSysMessages, () => taskStore.taskQueue, panelSessionEpoch],
   persistRecoveryState, { deep: true, flush: 'sync' })
 
@@ -306,7 +324,7 @@ function recoverDesktopRuntime(state: RuntimeState) {
   }
   expireStaleSysMessages()
   const messages = [currentSysMessage.value, ...sysMessageQueue.value, ...deferredSysMessages.value]
-    .filter((message): message is ResolvedSysMessage => Boolean(message && !isSysMessageExpired(message.expiresAt)))
+    .filter((message): message is ResolvedSysMessage => Boolean(message && !isSysMessageExpired(message.expiresAt) && !isLocallyDismissed(message)))
   const unique = [...new Map(messages.map(message => [message.dedupeKey, message])).values()]
   currentSysMessage.value = unique.shift() ?? null
   sysMessageQueue.value = unique
@@ -507,7 +525,7 @@ if (isSysMessagePreview) {
     })
   }
   if (hasSysMessagePreviewError) {
-    sysMessageActionError.value = '未能标记已读，请检查网络后重试'
+    sysMessageActionError.value = formatSysMessageActionError(new Error('服务端未确认消息已读'))
   }
 }
 
@@ -567,7 +585,7 @@ function rememberSysMessageKey(key: string) {
 function showNextSysMessage(now = Date.now()) {
   sysMessageActionError.value = ''
   sysMessageQueue.value = sysMessageQueue.value.filter(
-    (message) => !isSysMessageExpired(message.expiresAt, now),
+    (message) => !isSysMessageExpired(message.expiresAt, now) && !isLocallyDismissed(message),
   )
   currentSysMessage.value = sysMessageQueue.value.shift() ?? null
   if (currentSysMessage.value) {
@@ -579,7 +597,7 @@ function showNextSysMessage(now = Date.now()) {
 }
 
 function showIncomingSysMessage(message: ResolvedSysMessage) {
-  if (isSysMessageExpired(message.expiresAt)) return false
+  if (isSysMessageExpired(message.expiresAt) || isLocallyDismissed(message)) return false
 
   // A genuinely new reminder is allowed to wake an explicitly hidden
   // assistant. Do this before queue mutation so the reactive sync observes the
@@ -710,6 +728,17 @@ function hideCurrentSysMessage(message: SysMessageNotification) {
   sysMessageQueue.value = sysMessageQueue.value.filter((item) => item.dedupeKey !== message.dedupeKey)
 }
 
+function handleSysMessageDismiss(message: SysMessageNotification) {
+  const current = currentSysMessage.value
+  if (!current || current.dedupeKey !== message.dedupeKey) return
+  // Closing is a local presentation action, even while a read request is in
+  // flight. Preserve server unread status and suppress restart/catch-up replay.
+  dismissSysMessage(sysMessageUserId.value, current, current.expiresAt)
+  deferredSysMessages.value = deferredSysMessages.value.filter(item => item.id !== current.id)
+  sysMessageQueue.value = sysMessageQueue.value.filter(item => item.id !== current.id)
+  hideCurrentSysMessage(current)
+}
+
 async function handleSysMessageRead(message: SysMessageNotification) {
   if (isCurrentSysMessageReadPending.value) return
 
@@ -729,7 +758,7 @@ async function handleSysMessageRead(message: SysMessageNotification) {
     if (actionSession !== sysMessageEnrichmentGeneration) return
     console.warn('Failed to mark sys_message as read', error)
     if (currentSysMessage.value?.dedupeKey === message.dedupeKey) {
-      sysMessageActionError.value = '未能标记已读，请检查网络后重试'
+      sysMessageActionError.value = formatSysMessageActionError(error)
     }
   } finally {
     if (actionSession !== sysMessageEnrichmentGeneration) return
@@ -775,7 +804,7 @@ async function handleAllSysMessagesRead() {
     if (actionSession !== sysMessageEnrichmentGeneration) return
     console.warn('Failed to mark all sys_messages as read', error)
     if (currentSysMessage.value && snapshotKeys.has(currentSysMessage.value.dedupeKey)) {
-      sysMessageActionError.value = '未能全部标为已读，消息已保留，请稍后重试'
+      sysMessageActionError.value = formatSysMessageActionError(error, { all: true })
     }
   } finally {
     if (actionSession !== sysMessageEnrichmentGeneration) return
@@ -817,7 +846,7 @@ async function handleSysMessageView(message: SysMessageNotification) {
       if (actionSession !== sysMessageEnrichmentGeneration) return
       console.warn('Failed to mark viewed sys_message as read', error)
       if (currentSysMessage.value?.dedupeKey === message.dedupeKey) {
-        sysMessageActionError.value = '详情已打开，但未能标记已读；可点击“知道了”重试'
+        sysMessageActionError.value = formatSysMessageActionError(error, { viewed: true })
       }
       return
     }
@@ -903,7 +932,9 @@ function handleSystemNotificationAction(payload: MascotSystemNotificationAction)
   }
   if (!payload.message) return
   if (payload.message.dedupeKey !== currentSysMessage.value?.dedupeKey) return
-  if (payload.action === 'read') {
+  if (payload.action === 'dismiss') {
+    handleSysMessageDismiss(payload.message)
+  } else if (payload.action === 'read') {
     void handleSysMessageRead(payload.message)
   } else if (payload.action === 'view') {
     void handleSysMessageView(payload.message)
@@ -1267,6 +1298,21 @@ onMounted(async () => {
       MASCOT_SYSTEM_NOTIFICATION_LAYOUT_EVENT,
       (event) => notificationDelivery.acknowledge(event.payload.generation),
     )
+    removeSystemNotificationVisibilityListener = await listen<{ generation: number; visible: boolean }>(
+      MASCOT_SYSTEM_NOTIFICATION_VISIBILITY_EVENT,
+      ({ payload }) => {
+        if (payload.visible) notificationDelivery.acknowledgeVisible(payload.generation)
+        else if (notificationDelivery.revokeVisibility(payload.generation)) {
+          // Let menu/tray hide intent settle before restoring a lost native
+          // card. An unfinished/failed delivery never gets a fresh budget here.
+          window.clearTimeout(systemNotificationVisibilityRetryTimer)
+          systemNotificationVisibilityRetryTimer = window.setTimeout(() => {
+            systemNotificationVisibilityRetryTimer = undefined
+            void syncSystemNotificationWindow()
+          }, 100)
+        }
+      },
+    )
     removeSystemNotificationReadyListener = await listen(
       MASCOT_SYSTEM_NOTIFICATION_READY_EVENT,
       () => {
@@ -1497,6 +1543,7 @@ onUnmounted(() => {
   removeSystemNotificationActionListener?.()
   removeSystemNotificationReadyListener?.()
   removeSystemNotificationLayoutListener?.()
+  removeSystemNotificationVisibilityListener?.()
   notificationDelivery.dispose()
   removeContextMenuVisibilityListener?.()
   removeDeepLinkListener?.()
@@ -1504,6 +1551,7 @@ onUnmounted(() => {
   stopSessionValidation()
   stopAuthCallbackTimer()
   window.clearTimeout(sysMessageExpiryTimer)
+  window.clearTimeout(systemNotificationVisibilityRetryTimer)
   window.clearTimeout(taskDeliveryRetryTimer)
   if (windowMode === 'mascot') {
     websocketService.disconnect()
@@ -1513,7 +1561,11 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <main class="app-shell" :class="[`is-${windowMode}`]">
+  <main
+    class="app-shell"
+    :class="[`is-${windowMode}`]"
+    :data-notification-visible="releaseSmokePrepared ? Boolean(visibleSystemNotification) : undefined"
+  >
     <MascotWindow
       v-if="windowMode === 'mascot'"
       :needs-auth="needsAuth"

@@ -71,7 +71,7 @@ function loadUtility(file, globals) {
   return exports;
 }
 
-function harness({ acknowledge = true } = {}) {
+function harness({ acknowledge = true, paintReceipt = true } = {}) {
   const time = clock();
   const { createNotificationDelivery } = loadUtility('src/utils/notification-delivery.ts', time.globals);
   const { canOpenMascotTodoPanel } = loadUtility('src/utils/mascot-panel-access.ts', time.globals);
@@ -85,10 +85,12 @@ function harness({ acknowledge = true } = {}) {
   const visible = { value: null };
   const calls = { published: [], shows: 0, hides: 0, panelOpens: 0, fallback: [], repairs: 0, reconnects: 0 };
   let nativeVisible = false;
+  let nativeGeneration = 0;
   let delivery;
   const state = {
     ...time.globals,
     createNotificationDelivery, canOpenMascotTodoPanel, isSysMessageExpired,
+    isLocallyDismissed() { return false; },
     currentSysMessage: current, sysMessageQueue: queue, visibleSystemNotification: visible,
     deferredSysMessages: deferred, runtimeInteractive: { value: true }, runtimeRecovered: false,
     suppressRecoveredPresentation: false,
@@ -104,14 +106,19 @@ function harness({ acknowledge = true } = {}) {
     isCurrentSysMessageReadPending: { value: false },
     sysMessageReadAllPending: { value: false }, sysMessageActionError: { value: '' },
     MASCOT_SYSTEM_NOTIFICATION_PRESENT_EVENT: 'present',
+    MASCOT_SYSTEM_NOTIFICATION_PAINT_EVENT: 'paint',
     recordDesktopDiagnostic() {},
     async emitTo(_target, event, payload) {
+      if (event === 'paint') {
+        if (paintReceipt && nativeVisible) delivery.acknowledgeVisible(payload.generation);
+        return;
+      }
       if (event !== 'present') return;
       calls.published.push(payload);
       if (acknowledge && payload.presentation) delivery.acknowledge(payload.generation);
     },
     async showNotificationWindow() { return true; },
-    async showMascotSystemNotificationWindow() { calls.shows += 1; nativeVisible = true; return true; },
+    async showMascotSystemNotificationWindow(_compact, generation) { calls.shows += 1; nativeVisible = true; nativeGeneration = generation; return true; },
     async hideMascotSystemNotificationWindow() { calls.hides += 1; nativeVisible = false; return true; },
     mascotStore: { showMessage(...args) { calls.fallback.push(args); } },
     props: {
@@ -142,8 +149,9 @@ function harness({ acknowledge = true } = {}) {
   return {
     ...api, time, current, queue, deferred, visible, calls,
     setAcknowledgement(value) { acknowledge = value; },
+    setPaintReceipt(value) { paintReceipt = value; },
     get nativeVisible() { return nativeVisible; },
-    loseNativeSurface() { nativeVisible = false; },
+    loseNativeSurface() { nativeVisible = false; delivery.revokeVisibility(nativeGeneration); },
     hideByUser() { state.userHiddenSystemNotificationKey = state.systemNotificationMessageKey; },
     restoreNativeHiddenSnapshot() { state.suppressRecoveredPresentation = true; },
     dispose() { delivery.dispose(); },
@@ -199,11 +207,28 @@ await observe('scheduler-gap-during-delivery', async (h) => {
 await observe('lost-surface-after-success', async (h) => {
   await h.syncSystemNotificationWindow(); await h.time.tick(0);
   h.loseNativeSurface();
+  assert.equal(h.visible.value, null);
+  h.togglePanel(); assert.equal(h.calls.panelOpens, 1);
   h.recoverDesktopRuntime({ epoch: 2, interactive: true, recovered: true, visible: true });
   await h.time.tick(0);
   assert.equal(h.nativeVisible, true);
   assert.equal(h.calls.shows, 2);
   return { sameContentRedisplayedAfterNativeRecoveryEvent: true };
+});
+
+await observe('healthy-layout-and-native-show-without-card-frames', async (h) => {
+  h.setPaintReceipt(false);
+  await h.syncSystemNotificationWindow(); await h.time.tick(0);
+  assert.equal(h.nativeVisible, true);
+  assert.equal(h.visible.value, null);
+  await h.time.tick(10_000);
+  assert.equal(h.calls.shows, 3);
+  assert.equal(h.nativeVisible, false);
+  assert.equal(h.current.value, null);
+  assert.equal(h.deferred.value.length, 1);
+  assert.equal(h.calls.repairs, 1);
+  h.togglePanel(); assert.equal(h.calls.panelOpens, 1);
+  return { noWaveBeforeFrameReceipt: true, invisibleHeadReleased: true, unreadPreserved: true };
 });
 
 await observe('healthy-clock-rollback', async (h) => {

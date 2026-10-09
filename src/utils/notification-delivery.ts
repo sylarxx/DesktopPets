@@ -8,6 +8,7 @@ interface NotificationDeliveryOptions<T> {
   key: (presentation: T) => string
   publish: (delivery: NotificationDelivery<T>) => Promise<void>
   show: (generation: number, presentation: T) => Promise<boolean>
+  confirmVisible: (generation: number) => Promise<void>
   hide: (generation: number) => Promise<boolean>
   onVisible: (presentation: T | null) => void
   onStopped?: (presentation: T) => void
@@ -15,7 +16,8 @@ interface NotificationDeliveryOptions<T> {
 
 // A message's recovery budget survives duplicate events, content updates and
 // temporary hides. Only a distinct recovery event or session reset opens a new
-// bounded round. Duplicate ready events must not create unlimited retries.
+// bounded round. A confirmed card's native visibility loss permits a fresh
+// bounded show; duplicate ready/hide events cannot restart an unfinished round.
 export function createNotificationDelivery<T>(options: NotificationDeliveryOptions<T>) {
   const budgets = new Map<string, { attempts: number; deadline: number; stopped: boolean; complete: boolean }>()
   let intent = 0
@@ -26,9 +28,11 @@ export function createNotificationDelivery<T>(options: NotificationDeliveryOptio
   let activeKey = ''
   let fingerprint = ''
   let visible = false
+  let shownGeneration = 0
+  let revokedThroughGeneration = 0
   let retryTimer: ReturnType<typeof setTimeout> | undefined
   let deadlineTimer: ReturnType<typeof setTimeout> | undefined
-  let pending: { generation: number; finish: (ready: boolean) => void } | undefined
+  let pending: { generation: number; phase: 'layout' | 'paint'; finish: (ready: boolean) => void } | undefined
 
   function cancel() {
     intent += 1
@@ -39,19 +43,32 @@ export function createNotificationDelivery<T>(options: NotificationDeliveryOptio
   }
   function isCurrent(token: number) { return !disposed && token === intent }
   function acknowledge(generation: number) {
-    if (pending?.generation === generation) pending.finish(true)
+    if (pending?.generation === generation && pending.phase === 'layout') pending.finish(true)
   }
-  function waitForLayout(delivery: NotificationDelivery<T>) {
+  function acknowledgeVisible(generation: number) {
+    if (generation > revokedThroughGeneration && pending?.generation === generation && pending.phase === 'paint') pending.finish(true)
+  }
+  function revokeVisibility(generation: number) {
+    if (disposed) return false
+    revokedThroughGeneration = Math.max(revokedThroughGeneration, generation)
+    if (generation < shownGeneration) return false
+    const wasVisible = visible
+    visible = false
+    options.onVisible(null)
+    if (pending?.phase === 'paint' && generation >= pending.generation) pending.finish(false)
+    return wasVisible
+  }
+  function waitForReceipt(generation: number, phase: 'layout' | 'paint', publish: () => Promise<void>) {
     return new Promise<boolean>((resolve) => {
       const timeout = setTimeout(() => finish(false), 1500)
       const finish = (ready: boolean) => {
-        if (pending?.generation !== delivery.generation) return
+        if (pending?.generation !== generation || pending.phase !== phase) return
         clearTimeout(timeout)
         pending = undefined
         resolve(ready)
       }
-      pending = { generation: delivery.generation, finish }
-      void Promise.resolve().then(() => options.publish(delivery)).catch(() => finish(false))
+      pending = { generation, phase, finish }
+      void Promise.resolve().then(publish).catch(() => finish(false))
     })
   }
   function stop(token: number) {
@@ -78,9 +95,17 @@ export function createNotificationDelivery<T>(options: NotificationDeliveryOptio
     const generation = options.nextGeneration()
     let success = false
     try {
-      const ready = await waitForLayout({ generation, presentation })
+      const ready = await waitForReceipt(generation, 'layout', () => options.publish({ generation, presentation }))
       if (!isCurrent(token)) return
-      if (ready) success = await options.show(generation, presentation)
+      if (ready) {
+        shownGeneration = generation
+        success = await options.show(generation, presentation)
+        if (!isCurrent(token)) return
+        if (success) {
+          success = await waitForReceipt(generation, 'paint', () => options.confirmVisible(generation))
+          success = success && generation > revokedThroughGeneration
+        }
+      }
     } catch { /* Retry only within this message's original budget. */ }
     if (!isCurrent(token)) return
     if (success) {
@@ -96,6 +121,9 @@ export function createNotificationDelivery<T>(options: NotificationDeliveryOptio
     }
     visible = false
     options.onVisible(null)
+    // A shown HWND with no current renderer receipt must not remain as an
+    // invisible input blocker while the next bounded attempt is prepared.
+    if (budget.attempts < 3) void options.hide(options.nextGeneration()).catch(() => {})
     if (budget.attempts >= 3) stop(token)
     else retryTimer = setTimeout(() => { void attempt(token) }, 1000)
   }
@@ -105,17 +133,22 @@ export function createNotificationDelivery<T>(options: NotificationDeliveryOptio
   }
   const api = {
     acknowledge,
+    acknowledgeVisible,
+    revokeVisibility,
     sync(presentation: T | null) {
       if (disposed) return
       if (suspended) { latest = presentation; return }
       const nextKey = presentation === null ? '' : options.key(presentation)
       const nextFingerprint = JSON.stringify(presentation)
-      if (nextKey === activeKey && nextFingerprint === fingerprint) return
+      const existingBudget = budgets.get(nextKey)
+      const canRestoreRevoked = presentation !== null && !visible
+        && existingBudget?.complete && !existingBudget.stopped
+      if (nextKey === activeKey && nextFingerprint === fingerprint && !canRestoreRevoked) return
       fingerprint = nextFingerprint
       latest = presentation
       if (nextKey === activeKey && presentation !== null) {
-        if (visible) { publishUpdate(intent); options.onVisible(presentation) }
-        return
+        if (visible) { publishUpdate(intent); options.onVisible(presentation); return }
+        if (!canRestoreRevoked) return
       }
       cancel()
       activeKey = nextKey

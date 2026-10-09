@@ -1,12 +1,15 @@
 <script setup lang="ts">
 import { emitTo, listen, type UnlistenFn } from '@tauri-apps/api/event'
+import { invoke } from '@tauri-apps/api/core'
 import { nextTick, onMounted, onUnmounted, ref } from 'vue'
 import AuthLoginTip from '../components/AuthLoginTip.vue'
 import SysMessageTip from '../components/SysMessageTip.vue'
+import { createNotificationPaintReceipt } from '../utils/notification-paint'
 import {
   MASCOT_SYSTEM_NOTIFICATION_ACTION_EVENT,
   MASCOT_SYSTEM_NOTIFICATION_PRESENT_EVENT,
   MASCOT_SYSTEM_NOTIFICATION_LAYOUT_EVENT,
+  MASCOT_SYSTEM_NOTIFICATION_PAINT_EVENT,
   setMascotSystemNotificationReady,
   type MascotSystemNotificationAction,
   type MascotSystemNotificationPresentation,
@@ -22,9 +25,19 @@ let readyAttempts = 0
 const placement = ref('above')
 let removePlacementListener: UnlistenFn | undefined
 let removePresentationListener: UnlistenFn | undefined
-const preview = import.meta.env.DEV
-  ? new URLSearchParams(window.location.search).get('preview')
-  : null
+let removePaintListener: UnlistenFn | undefined
+const paintReceipt = createNotificationPaintReceipt({
+  requestFrame: (callback) => requestAnimationFrame(callback),
+  cancelFrame: (frame) => cancelAnimationFrame(frame),
+  canConfirm(generation) {
+    if (disposed || generation !== deliveryGeneration || !presentation.value) return false
+    const bounds = notificationWindow.value?.firstElementChild?.getBoundingClientRect()
+    return Boolean(bounds && bounds.width > 0 && bounds.height > 0)
+  },
+  confirm: (clientGeneration) => invoke('ack_mascot_system_notification_visible', { clientGeneration }),
+})
+const previewQuery = import.meta.env.DEV ? new URLSearchParams(window.location.search) : null
+const preview = previewQuery?.get('preview')
 
 if (preview === 'auth' || preview === 'auth-pending') {
   presentation.value = {
@@ -51,9 +64,10 @@ if (preview === 'auth' || preview === 'auth-pending') {
     },
     displayContent: '您的项目评审会议将在 15 分钟后开始，请提前准备相关材料。',
     pendingCount: 2,
-    readPending: false,
+    readPending: previewQuery?.get('previewPending') === '1',
     readAllPending: false,
-    actionError: '',
+    actionError: previewQuery?.get('previewError') === '1'
+      ? '后台尚未确认消息已读，可重试或关闭提醒' : '',
   }
 }
 
@@ -64,6 +78,11 @@ function publishAction(action: MascotSystemNotificationAction) {
 function handleRead() {
   if (presentation.value?.kind !== 'message') return
   publishAction({ action: 'read', message: presentation.value.message })
+}
+
+function handleDismiss() {
+  if (presentation.value?.kind !== 'message') return
+  publishAction({ action: 'dismiss', message: presentation.value.message })
 }
 
 function handleReadAll() {
@@ -81,6 +100,7 @@ function handleLogin() {
 
 async function applyPresentation(delivery: MascotSystemNotificationDelivery) {
   if (disposed || delivery.generation <= deliveryGeneration) return
+  paintReceipt.cancel()
   deliveryGeneration = delivery.generation
   presentation.value = delivery.presentation
   await nextTick()
@@ -110,6 +130,10 @@ onMounted(async () => {
       void applyPresentation(event.payload).catch(() => {})
     },
   )
+  removePaintListener = await listen<{ generation: number }>(
+    MASCOT_SYSTEM_NOTIFICATION_PAINT_EVENT,
+    ({ payload }) => paintReceipt.request(payload.generation),
+  )
   removePlacementListener = await listen<string>('mascot-system-notification-placement', (event) => {
     placement.value = event.payload
   })
@@ -120,6 +144,8 @@ onUnmounted(() => {
   disposed = true
   window.clearTimeout(readyRetryTimer)
   removePresentationListener?.()
+  removePaintListener?.()
+  paintReceipt.cancel()
   removePlacementListener?.()
 })
 </script>
@@ -147,6 +173,7 @@ onUnmounted(() => {
       @read="handleRead"
       @read-all="handleReadAll"
       @view="handleView"
+      @dismiss="handleDismiss"
     />
   </section>
 </template>

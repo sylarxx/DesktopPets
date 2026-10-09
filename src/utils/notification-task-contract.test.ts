@@ -2,6 +2,8 @@ import { describe, expect, it } from 'vitest'
 import { readFileSync } from 'node:fs'
 import appSource from '../App.vue?raw'
 import deliverySource from './notification-delivery.ts?raw'
+import paintReceiptSource from './notification-paint.ts?raw'
+import actionErrorSource from './sys-message-action-error.ts?raw'
 import authLoginTipSource from '../components/AuthLoginTip.vue?raw'
 import taskCardSource from '../components/TaskPushCard.vue?raw'
 import sysMessageTipSource from '../components/SysMessageTip.vue?raw'
@@ -315,7 +317,17 @@ describe('notification and task production contracts', () => {
     const delivery = section(appSource, 'const notificationDelivery =', 'let isDeliveringDeferredTasks')
     expectInOrder(delivery, "emitTo( 'mascot-notification'", 'await showNotificationWindow()', "await showMascotSystemNotificationWindow( presentation.kind === 'auth', syncGeneration, )")
     expect(sync).toContain('notificationDelivery.sync(')
-    expectInOrder(deliverySource, 'const ready = await waitForLayout', 'if (!isCurrent(token)) return', 'if (ready) success = await options.show')
+    expectInOrder(
+      deliverySource,
+      "const ready = await waitForReceipt(generation, 'layout'",
+      'if (!isCurrent(token)) return',
+      'if (ready)',
+      'success = await options.show(generation, presentation)',
+      "success = await waitForReceipt(generation, 'paint'",
+      'success = success && generation > revokedThroughGeneration',
+      'visible = true',
+      'options.onVisible(latest)',
+    )
     expect(mascotWindowSource).toContain('() => props.needsAuth')
     expect(appSource).toContain("kind: 'auth'")
     expect(appSource).toContain("kind: 'message'")
@@ -333,12 +345,45 @@ describe('notification and task production contracts', () => {
     expect(mascotNotificationWindowSource).not.toContain('hideMascotSystemNotificationWindow')
   })
 
-  it('ACKs committed card layout without a hidden-window transition and gates waving on display', () => {
+  it('ACKs hidden layout immediately and gates waving on post-show frames and native visibility', () => {
     const apply = section(mascotNotificationWindowSource, 'async function applyPresentation', 'async function announceReady')
+    const nativeConfirmation = section(
+      rustSource,
+      'fn ack_mascot_system_notification_visible',
+      '#[tauri::command]\nfn show_mascot_system_notification_window',
+    )
+    const nativeGeneration = section(rustSource, 'fn confirms_visible_client_generation', 'fn revoke_visibility')
     expectInOrder(apply, 'delivery.generation <= deliveryGeneration', 'presentation.value = delivery.presentation', 'await nextTick()', 'delivery.generation !== deliveryGeneration', 'getBoundingClientRect()', 'bounds.width <= 0', "await emitTo('mascot', MASCOT_SYSTEM_NOTIFICATION_LAYOUT_EVENT")
     expect(mascotNotificationWindowSource).not.toContain('<Transition')
-    expect(mascotNotificationWindowSource).not.toContain('requestAnimationFrame(')
+    // Hidden layout must remain synchronous after Vue flush. Frame waiting is
+    // restricted to the separate receipt requested after the native show.
+    expect(apply).not.toContain('requestAnimationFrame(')
+    expect(apply).not.toContain('requestFrame(')
+    expectInOrder(
+      paintReceiptSource,
+      'request(generation: number)',
+      'cancel()',
+      'frame = options.requestFrame(() => {',
+      'frame = options.requestFrame(() => {',
+      'token !== intent || !options.canConfirm(generation)',
+      'options.confirm(generation)',
+    )
+    expect(mascotNotificationWindowSource).toContain('generation !== deliveryGeneration')
+    expect(mascotNotificationWindowSource).toContain("invoke('ack_mascot_system_notification_visible', { clientGeneration })")
+    expectInOrder(
+      nativeConfirmation,
+      'window.label() != "mascot-notification"',
+      '!runtime.interactive()',
+      '!state.confirms_visible_client_generation(client_generation)',
+      'let visible = matches!(window.is_visible(), Ok(true))',
+      '!state.confirms_visible_client_generation(client_generation)',
+      'emit_mascot_system_notification_visibility(window.app_handle(), client_generation, true)',
+    )
+    expect(nativeConfirmation).not.toContain('.lock()')
+    expectInOrder(nativeGeneration, 'status.ready', 'status.desired_visible', 'status.visible', 'status.client_generation == client_generation')
     expect(appSource).toContain('notificationDelivery.acknowledge(event.payload.generation)')
+    expect(appSource).toContain('notificationDelivery.acknowledgeVisible(payload.generation)')
+    expect(appSource).toContain('notificationDelivery.revokeVisibility(payload.generation)')
     expect(appSource).toContain(':system-message-visible="systemMessageWindowVisible"')
     expect(mascotWindowSource).toContain("props.sysMessage && props.systemMessageVisible && waveCycles.value > 0 ? 'waving'")
     expect(appSource).toContain('visibleSystemNotification.value.message.dedupeKey === currentSysMessage.value?.dedupeKey')
@@ -483,6 +528,11 @@ describe('notification and task production contracts', () => {
       'fn show_mascot_system_notification_window',
       '#[tauri::command]\nfn hide_mascot_system_notification_window',
     )
+    const nativeRevoke = section(
+      rustSource,
+      'fn revoke_mascot_system_notification_visibility',
+      'fn hide_mascot_system_notification_native_window_with_generation',
+    )
     const sync = section(
       appSource,
       'async function syncSystemNotificationWindow',
@@ -491,7 +541,10 @@ describe('notification and task production contracts', () => {
 
     expectInOrder(safeHide, 'set_ignore_cursor_events(true)', 'window.hide()')
     expectInOrder(safeShow, 'set_ignore_cursor_events(false)', 'show_window_without_activation')
-    expectInOrder(nativeHide, 'state.request_hide(client_generation)', 'state.transition.lock()', 'state.can_hide(generation)', 'hide_transparent_window_safely(&window)', 'state.mark_physical_hidden()')
+    expectInOrder(nativeHide, 'state.request_hide(client_generation)', 'state.transition.lock()', 'state.can_hide(generation)', 'revoke_mascot_system_notification_visibility(app)', 'hide_transparent_window_safely(&window)')
+    expectInOrder(nativeRevoke, 'let client_generation = state.revoke_visibility()', 'emit_mascot_system_notification_visibility(app, client_generation, false)')
+    const revokeDelivery = section(deliverySource, 'function revokeVisibility', 'function waitForReceipt')
+    expectInOrder(revokeDelivery, 'revokedThroughGeneration = Math.max', 'if (generation < shownGeneration) return', 'visible = false', 'options.onVisible(null)')
     expectInOrder(nativeShow, 'state.request_show(compact, client_generation)', 'state.transition.lock()', 'state.can_show(generation, compact)', 'position_mascot_system_notification_window', 'show_interactive_window(&notification, false)', 'state.mark_visible(generation, compact)')
     expectInOrder(sync, 'if (!presentation)', 'notificationDelivery.sync(', 'suppressedByUserHide || contextMenuWindowVisible.value ? null : presentation')
     expectInOrder(deliverySource, 'if (presentation === null)', 'const generation = options.nextGeneration()', 'options.hide(generation)', 'options.publish({ generation, presentation: null })')
@@ -581,7 +634,12 @@ describe('notification and task production contracts', () => {
     expect(sysMessageTipSource).toContain("全部已读")
     expect(sysMessageTipSource).toContain("emit('readAll')")
     expectInOrder(batchService, 'unreadMessages', 'new Set', "request.put<unknown, boolean>('/sys-message/read', { ids })", 'markedRead !== true', 'message.msgStatus = 1')
-    expectInOrder(batchHandler, 'snapshot.length < 2', 'sysMessageReadAllPending.value = true', 'await sysMessageService.markAllRead(snapshot)', 'snapshotKeys', 'currentSysMessage.value = remainingMessages.shift() ?? null', 'catch (error)', '消息已保留')
+    expectInOrder(batchHandler, 'snapshot.length < 2', 'sysMessageReadAllPending.value = true', 'await sysMessageService.markAllRead(snapshot)', 'snapshotKeys', 'currentSysMessage.value = remainingMessages.shift() ?? null', 'catch (error)', 'formatSysMessageActionError(error, { all: true })')
+    const batchFailure = section(batchHandler, 'catch (error)', 'finally')
+    expect(batchFailure).not.toContain('currentSysMessage.value =')
+    expect(batchFailure).not.toContain('sysMessageQueue.value =')
+    expect(actionErrorSource).toContain("options.all ? '全部消息' : '消息'")
+    expect(actionErrorSource).toContain('可重试或关闭提醒')
   })
 
   it('clears queued delivery state and invalidates old panel events on session clear', () => {
@@ -622,13 +680,15 @@ describe('notification and task production contracts', () => {
     expect(taskCardSource).not.toContain('autofocus')
   })
 
-  it('treats markRead data false as failure and keeps the system card visible', () => {
-    const markRead = section(sysMessageServiceSource, 'async markRead', 'disconnect()')
-    const readHandler = section(appSource, 'async function handleSysMessageRead', 'async function handleSysMessageView')
+  it('accepts literal false only after authenticated read-state confirmation and preserves unconfirmed cards', () => {
+    const markRead = section(sysMessageServiceSource, 'async markRead', 'async markAllRead')
+    const confirmation = section(sysMessageServiceSource, 'async function confirmMessagesAlreadyRead', 'function toWsProtocol')
+    const readHandler = section(appSource, 'async function handleSysMessageRead', 'async function handleAllSysMessagesRead')
     const viewHandler = section(appSource, 'async function handleSysMessageView', 'function connectDesktopSockets')
 
-    expectInOrder(markRead, 'const markedRead = await request.put', "if (markedRead !== true) throw new Error('服务端未确认消息已读')", 'message.msgStatus = 1')
-    expectInOrder(readHandler, 'await sysMessageService.markRead(message)', 'hideCurrentSysMessage(message)', 'catch (error)', "sysMessageActionError.value = '未能标记已读，请检查网络后重试'")
+    expectInOrder(markRead, 'const markedRead = await request.put', 'markedRead !== true', 'markedRead === false && await confirmMessagesAlreadyRead([message.id])', "throw new Error('服务端未确认消息已读')", 'message.msgStatus = 1')
+    expectInOrder(confirmation, 'pageNum <= READ_RECONCILIATION_MAX_PAGES', 'READ_RECONCILIATION_TIMEOUT_MS - (Date.now() - startedAt)', 'if (timeoutMs <= 0) break', "'/sys-message/page'", 'msgStatus: 1', 'if (Number(row.msgStatus) === 1) remainingIds.delete(id)', 'if (!remainingIds.size) return true', 'return false')
+    expectInOrder(readHandler, 'await sysMessageService.markRead(message)', 'hideCurrentSysMessage(message)', 'catch (error)', 'sysMessageActionError.value = formatSysMessageActionError(error)')
     expectInOrder(viewHandler, 'const opened = await openSysMessageDetail(message)', 'if (!opened)', 'await sysMessageService.markRead(message)', 'catch (error)', 'return', 'hideCurrentSysMessage(message)')
   })
 
